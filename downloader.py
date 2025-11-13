@@ -1,0 +1,968 @@
+import os
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from urllib.parse import urlparse, unquote, parse_qs
+import time
+import logging
+from typing import Optional, Dict, List
+import re
+import gdown
+from llm_parser import SmartParser
+from skyvern_api_downloader import download_with_skyvern_api
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MAX_FILES_PER_CASE = 100  # Safety limit
+
+class FileDownloader:
+    def __init__(self, download_path: str):
+        self.download_path = download_path
+        os.makedirs(download_path, exist_ok=True)
+        # Initialize smart LLM parser for credentials
+        try:
+            self.smart_parser = SmartParser()
+            logger.info("Smart LLM parser initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize smart parser: {e}")
+            self.smart_parser = None
+        # Initialize smart LLM parser for credentials
+        try:
+            self.smart_parser = SmartParser()
+            logger.info("Smart LLM parser initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize smart parser: {e}")
+            self.smart_parser = None
+
+    def download_file(self, url: str, case_folder: str, login_creds: Optional[str] = None) -> Optional[str]:
+        """
+        Download file(s) from URL. Returns the case folder path if successful.
+        Handles both single file downloads and portal pages with multiple files.
+        """
+        case_download_path = os.path.join(self.download_path, case_folder)
+        os.makedirs(case_download_path, exist_ok=True)
+
+        logger.info(f"Attempting to download: {url}")
+
+        # Check if it's a Google Drive URL
+        if 'drive.google.com' in url or 'docs.google.com' in url:
+            logger.info("Detected Google Drive URL")
+            return self._google_drive_download(url, case_download_path)
+
+        # Try Skyvern FIRST for portal pages (PRIMARY METHOD with Gemini 2.5 Flash)
+        logger.info(f"Attempting download with Skyvern (Gemini 2.5 Flash) for: {url}")
+
+        # Parse credentials if provided
+        username = None
+        password = None
+        if login_creds:
+            # Try smart LLM parser first
+            if self.smart_parser:
+                try:
+                    parsed = self.smart_parser.parse_credentials(login_creds)
+                    username = parsed.get('username')
+                    password = parsed.get('password')
+                    logger.info(f"Smart parser extracted credentials: username={username}")
+                except Exception as e:
+                    logger.warning(f"Smart parser failed: {e}, falling back to simple split")
+
+            # Fallback to simple split if parser didn't work
+            if not username and ':' in login_creds:
+                parts = login_creds.split(':', 1)
+                username = parts[0].strip()
+                password = parts[1].strip() if len(parts) > 1 else None
+                logger.info(f"Simple split extracted: username={username}")
+
+        # Try Skyvern
+        skyvern_success = download_with_skyvern_api(
+            url=url,
+            download_path=case_download_path,
+            username=username,
+            password=password,
+            suspect_name=case_folder
+        )
+
+        if skyvern_success:
+            logger.info("Skyvern successfully downloaded files!")
+            # Return the first file in the download directory
+            files = [f for f in os.listdir(case_download_path) if os.path.isfile(os.path.join(case_download_path, f))]
+            if files:
+                return os.path.join(case_download_path, files[0])
+
+        logger.warning("Skyvern failed, trying fallback methods...")
+
+        # Try simple download for direct file links
+        downloaded_file = self._simple_download(url, case_download_path)
+
+        if downloaded_file:
+            logger.info("Simple download succeeded!")
+            return downloaded_file
+
+        # Fall back to Playwright as last resort
+        logger.info(f"Simple download failed, trying Playwright as last resort for: {url}")
+        return self._playwright_download_all(url, case_download_path, login_creds)
+
+    def _google_drive_download(self, url: str, download_path: str) -> Optional[str]:
+        """Download files from Google Drive folder or file using gdown"""
+        try:
+            # Extract folder or file ID from URL
+            folder_id = None
+            file_id = None
+
+            if '/folders/' in url:
+                folder_id = url.split('/folders/')[1].split('?')[0]
+            elif '/file/d/' in url:
+                file_id = url.split('/file/d/')[1].split('/')[0]
+            elif 'id=' in url:
+                parsed = parse_qs(urlparse(url).query)
+                id_val = parsed.get('id', [None])[0]
+                folder_id = id_val
+
+            if folder_id:
+                logger.info(f"Google Drive folder ID: {folder_id}")
+                folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+                try:
+                    gdown.download_folder(folder_url, output=download_path, quiet=False, use_cookies=False)
+
+                    downloaded_files = [f for f in os.listdir(download_path) if os.path.isfile(os.path.join(download_path, f))]
+                    if downloaded_files:
+                        logger.info(f"Downloaded {len(downloaded_files)} file(s) from Google Drive folder")
+                        return os.path.join(download_path, downloaded_files[0])
+                    else:
+                        logger.warning("No files downloaded from Google Drive folder")
+                        return None
+                except Exception as e:
+                    logger.error(f"gdown folder download failed: {e}")
+                    return None
+
+            elif file_id:
+                logger.info(f"Google Drive file ID: {file_id}")
+                file_url = f"https://drive.google.com/uc?id={file_id}"
+                try:
+                    output_file = os.path.join(download_path, "gdrive_file")
+                    gdown.download(file_url, output_file, quiet=False)
+
+                    if os.path.exists(output_file):
+                        logger.info(f"Downloaded file from Google Drive")
+                        return output_file
+                    else:
+                        logger.warning("File not downloaded from Google Drive")
+                        return None
+                except Exception as e:
+                    logger.error(f"gdown file download failed: {e}")
+                    return None
+            else:
+                logger.warning("Could not extract Google Drive folder/file ID from URL")
+                return None
+
+        except Exception as e:
+            logger.error(f"Google Drive download failed: {e}")
+            return None
+
+    def _simple_download(self, url: str, download_path: str) -> Optional[str]:
+        """Simple HTTP download using requests"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            response = requests.get(url, headers=headers, stream=True, timeout=30)
+
+            if response.status_code == 200:
+                content_type = response.headers.get('Content-Type', '')
+                if 'text/html' in content_type:
+                    return None
+
+                filename = self._get_filename_from_response(response, url)
+                filepath = os.path.join(download_path, filename)
+
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                logger.info(f"Successfully downloaded: {filename}")
+                return filepath
+            else:
+                logger.warning(f"HTTP {response.status_code} for {url}")
+                return None
+
+        except Exception as e:
+            logger.warning(f"Simple download failed for {url}: {e}")
+            return None
+
+    def _playwright_download_all(self, url: str, download_path: str, login_creds: Optional[str] = None) -> Optional[str]:
+        """Download ALL files from a portal page using Playwright (with pagination support)"""
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    accept_downloads=True,
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                )
+                page = context.new_page()
+
+                # Check if URL looks like a direct download link (evidence.com, etc.)
+                if self._is_direct_download_url(url):
+                    logger.info("Detected direct download URL, attempting auto-download...")
+                    downloaded_file = self._handle_auto_download(page, url, download_path)
+                    browser.close()
+                    if downloaded_file:
+                        return downloaded_file
+                    else:
+                        logger.warning("Auto-download failed, falling back to page scraping")
+                        # Re-open browser for fallback
+                        browser = p.chromium.launch(headless=True)
+                        context = browser.new_context(
+                            accept_downloads=True,
+                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        )
+                        page = context.new_page()
+
+                page.goto(url, wait_until='networkidle', timeout=60000)
+                page.wait_for_timeout(3000)
+
+                page.goto(url, wait_until='networkidle', timeout=60000)
+                page.wait_for_timeout(3000)
+
+                # If login credentials provided, always attempt to handle login/auth with retries
+                if login_creds:
+                    logger.info('Login credentials provided, checking if login is needed')
+
+                    # Try login with retries
+                    max_login_retries = 3
+                    for login_attempt in range(max_login_retries):
+                        logger.info(f'Login attempt {login_attempt + 1}/{max_login_retries}')
+                        self._handle_login_flow(page, login_creds)
+
+                        # Wait MUCH longer for page to load after login
+                        logger.info('Waiting 10 seconds for page to fully load after login...')
+                        page.wait_for_timeout(10000)  # 10 seconds instead of 3
+
+                        # Check if we're still on a login page
+                        if not self._is_login_page(page):
+                            logger.info('Successfully navigated past login page')
+                            break
+                        else:
+                            logger.warning(f'Still on login page after attempt {login_attempt + 1}, retrying...')
+
+                    # Extra wait for content to load
+                    page.wait_for_timeout(5000)
+                # Use AI vision to navigate to downloads if available
+                # Try clicking multiple common navigation tabs BEFORE AI analysis
+
+                nav_tabs = [
+                    'text=Documents',
+                    'text=Attachments',
+                    'text=Files',
+                    'text=Media',
+                    'a:has-text("Documents")',
+                    'button:has-text("Documents")',
+                    '[role="tab"]:has-text("Documents")',
+                    'a:has-text("Attachments")',
+                    'button:has-text("Attachments")',
+                ]
+
+                for tab_selector in nav_tabs:
+                    try:
+                        if page.locator(tab_selector).count() > 0:
+                            logger.info(f"Found and clicking tab: {tab_selector}")
+                            page.click(tab_selector, timeout=5000)
+                            page.wait_for_timeout(3000)
+                            logger.info(f"Successfully clicked {tab_selector}")
+                            break
+                    except Exception as e:
+                        logger.debug(f"Tab {tab_selector} not found or click failed: {e}")
+
+                
+
+                logger.info("Using AI vision to navigate page")
+                self._ai_navigate_to_downloads(page, download_path)
+
+                
+
+                # Ensure we're still on Documents tab and page is ready
+
+                page.wait_for_timeout(2000)
+
+                try:
+
+                    if page.locator('text=Documents').count() > 0:
+
+                        page.click('text=Documents', timeout=3000)
+
+                        page.wait_for_timeout(2000)
+
+                        logger.info("Re-clicked Documents tab before scanning")
+
+                except Exception as e:
+
+                    logger.debug(f"Could not re-click Documents: {e}")
+
+                
+                # Collect download links from ALL pages (handle pagination)
+                all_download_elements = self._collect_all_pages_downloads(page)
+
+                if not all_download_elements:
+                    logger.warning("No download links found on any page")
+                    browser.close()
+                    return None
+
+                # Apply safety limit
+                if len(all_download_elements) > MAX_FILES_PER_CASE:
+                    logger.warning(f"Found {len(all_download_elements)} links, limiting to {MAX_FILES_PER_CASE}")
+                    all_download_elements = all_download_elements[:MAX_FILES_PER_CASE]
+
+                logger.info(f"Found {len(all_download_elements)} total download link(s) across all pages")
+
+                # Download each file
+                downloaded_files = []
+                for i, element_info in enumerate(all_download_elements, 1):
+                    logger.info(f"Downloading file {i}/{len(all_download_elements)}...")
+                    filepath = self._download_single_element(page, element_info, download_path, i)
+                    if filepath:
+                        downloaded_files.append(filepath)
+                        logger.info(f"Downloaded: {os.path.basename(filepath)}")
+                    page.wait_for_timeout(2000)
+
+                browser.close()
+
+                if downloaded_files:
+                    logger.info(f"Successfully downloaded {len(downloaded_files)} file(s)")
+                    return downloaded_files[0]
+                else:
+                    logger.warning("No files were downloaded")
+                    return None
+
+        except Exception as e:
+            logger.error(f"Playwright download failed for {url}: {e}")
+            return None
+
+    def _ai_navigate_to_downloads(self, page, download_path: str, max_steps: int = 5) -> bool:
+        """
+        Use AI vision to intelligently navigate the page to find downloads
+
+        Returns True if navigation was successful and page is ready for download extraction
+        """
+        try:
+            from vision_helper import VisionNavigator
+            navigator = VisionNavigator()
+
+            for step in range(max_steps):
+                logger.info(f"AI Navigation Step {step + 1}/{max_steps}")
+
+                # Take screenshot
+                screenshot_path = os.path.join(download_path, f'ai_nav_step_{step}.png')
+                page.screenshot(path=screenshot_path)
+                logger.info(f"Captured screenshot: {screenshot_path}")
+
+                # Analyze with AI
+                context = f"Step {step + 1}: Looking for downloadable files or navigation to documents/files section"
+                analysis = navigator.analyze_page_for_downloads(screenshot_path, context)
+
+                logger.info(f"AI Analysis - Action: {analysis['action']}, Target: {analysis['target']}")
+                logger.info(f"AI Reasoning: {analysis['reasoning']}")
+
+                action = analysis['action']
+
+                if action == 'done':
+                    logger.info("AI determined navigation is complete")
+                    return True
+
+                elif action == 'error':
+                    logger.error(f"AI detected error: {analysis['reasoning']}")
+                    return False
+
+                elif action == 'click':
+                    # AI wants to click something
+                    target = analysis['target']
+                    logger.info(f"AI instructed to click: {target}")
+
+                    # Try to click the target with fallback selectors
+                    clicked = False
+                    selectors_to_try = [target]
+
+                    # Add fallback selectors for common cases
+                    reasoning_lower = analysis['reasoning'].lower()
+                    if 'documents' in reasoning_lower:
+                        selectors_to_try.extend([
+                            'text=Documents',
+                            'button:has-text("Documents")',
+                            'a:has-text("Documents")',
+                            '[role="tab"]:has-text("Documents")',
+                            'div:has-text("Documents")'
+                        ])
+                    elif 'files' in reasoning_lower:
+                        selectors_to_try.extend([
+                            'text=Files',
+                            'button:has-text("Files")',
+                            'a:has-text("Files")'
+                        ])
+                    elif 'download' in reasoning_lower:
+                        selectors_to_try.extend([
+                            'text=Download',
+                            'button:has-text("Download")',
+                            'a:has-text("Download")',
+                            '.download',
+                            '#download',
+                            '[class*="download"]',
+                            'button.btn-success:has-text("Download")',
+                            'button[type="submit"]:has-text("Download")'
+                        ])
+
+                    for selector in selectors_to_try:
+                        try:
+                            if page.locator(selector).count() > 0:
+                                page.click(selector, timeout=10000)
+                                page.wait_for_timeout(3000)
+                                logger.info(f"Successfully clicked using selector: {selector}")
+                                clicked = True
+                                break
+                        except Exception as e:
+                            logger.debug(f"Selector {selector} failed: {e}")
+                            continue
+
+                    if not clicked:
+                        logger.warning(f"Could not click any selector for: {target}")
+
+                elif action == 'navigate':
+                    # AI wants us to paginate or navigate
+                    logger.info("AI detected pagination - will handle in normal flow")
+                    return True
+
+                elif action == 'extract':
+                    # AI found download links or navigation to download section
+                    # If the target looks like a navigation element, click it first
+                    if 'Documents' in analysis['reasoning'] or 'click' in analysis['reasoning'].lower():
+                        target = analysis['target']
+                        logger.info(f"AI suggests clicking navigation element: {target}")
+
+                        # Try multiple selector strategies to find and click the button
+                        clicked = False
+                        strategies = [
+                            target,  # Try AI-suggested selector first
+                            f"text={target.split('has-text(')[1].strip('\'")')})" if 'has-text' in target else None,  # Extract text and try text= selector
+                            "button:has-text('Download')",  # Common download button
+                            "text=Download",  # Simple text selector
+                            "a:has-text('Download')",  # Download link
+                            "[type='submit']",  # Submit button
+                            "button >> text=/download/i",  # Case-insensitive download button
+                            "a >> text=/download/i",  # Case-insensitive download link
+                        ]
+
+                        for strategy in strategies:
+                            if not strategy:
+                                continue
+                            try:
+                                if page.locator(strategy).count() > 0:
+                                    logger.info(f"Found element with selector: {strategy}")
+                                    page.click(strategy, timeout=10000)
+                                    page.wait_for_timeout(3000)
+                                    logger.info(f"Successfully clicked using: {strategy}")
+                                    clicked = True
+                                    break
+                            except Exception as e:
+                                logger.debug(f"Selector {strategy} failed: {e}")
+                                continue
+
+                        if not clicked:
+                            logger.warning(f"Could not find or click element after trying multiple strategies")
+                            # Don't give up - continue to see if we can extract links
+                            return True
+
+                        # Continue to next step to see what we found
+                    else:
+                        logger.info("AI found download links - proceeding to extraction")
+                        return True
+
+            logger.warning(f"Reached max steps ({max_steps}) without completing navigation")
+            return True  # Proceed anyway, regular download logic will handle
+
+        except ImportError:
+            logger.warning("Vision helper not available, skipping AI navigation")
+            return True
+        except Exception as e:
+            logger.error(f"Error in AI navigation: {e}")
+            import traceback
+            traceback.print_exc()
+            return True  # Don't fail entirely, try regular extraction
+
+
+    def _collect_all_pages_downloads(self, page) -> List[Dict]:
+        """Collect download links from all paginated pages"""
+        all_elements = []
+        page_num = 1
+        max_pages = 20
+
+        while page_num <= max_pages:
+            logger.info(f"Scanning page {page_num} for download links...")
+
+            page_elements = self._find_all_download_elements(page)
+            if page_elements:
+                all_elements.extend(page_elements)
+                logger.info(f"Found {len(page_elements)} link(s) on page {page_num}")
+
+            if not self._click_next_page(page):
+                logger.info(f"No more pages found (stopped at page {page_num})")
+                break
+
+            page_num += 1
+            page.wait_for_timeout(2000)
+
+        # Remove duplicates
+        seen_hrefs = set()
+        unique_elements = []
+        for elem in all_elements:
+            href = elem.get('href')
+            if href and href not in seen_hrefs:
+                seen_hrefs.add(href)
+                unique_elements.append(elem)
+            elif not href:
+                unique_elements.append(elem)
+
+        return unique_elements
+
+    def _click_next_page(self, page) -> bool:
+        """Try to click next page button. Returns True if successful."""
+        next_selectors = [
+            'button:has-text("Next")',
+            'a:has-text("Next")',
+            'button:has-text("›")',
+            'a:has-text("›")',
+            'button:has-text("→")',
+            'a:has-text("→")',
+            'button[aria-label*="next" i]',
+            'a[aria-label*="next" i]',
+            'button[class*="next" i]',
+            'a[class*="next" i]',
+            '.pagination button:last-child',
+            '.pagination a:last-child',
+            'button[title*="next" i]',
+            'a[title*="next" i]',
+        ]
+
+        for selector in next_selectors:
+            try:
+                next_button = page.locator(selector).first
+                if next_button.is_visible() and next_button.is_enabled():
+                    classes = next_button.get_attribute('class') or ''
+                    disabled_attr = next_button.get_attribute('disabled')
+
+                    if 'disabled' not in classes.lower() and disabled_attr != 'disabled':
+                        next_button.click(timeout=5000)
+                        logger.info(f"Clicked next page button: {selector}")
+                        return True
+            except Exception as e:
+                logger.debug(f"Next button selector {selector} failed: {e}")
+                continue
+
+        return False
+
+    def _find_all_download_elements(self, page) -> List[Dict]:
+        """Find all download links/buttons on the current page with BALANCED selectors"""
+        download_elements = []
+
+        # Balanced selectors - specific enough to avoid false positives, broad enough to catch real downloads
+        selectors = [
+            # Explicit download attributes (highest priority)
+            'a[download]',
+            'a[href*="/download"]',
+            'button:has-text("Download")',
+            'a:has-text("Download")',
+
+            # File extensions
+            'a[href$=".pdf"]',
+            'a[href$=".zip"]',
+            'a[href$=".mp4"]',
+            'a[href$=".mp3"]',
+            'a[href$=".mov"]',
+            'a[href$=".avi"]',
+            'a[href$=".doc"]',
+            'a[href$=".docx"]',
+            'a[href$=".xls"]',
+            'a[href$=".xlsx"]',
+            'a[href$=".csv"]',
+            'a[href$=".txt"]',
+            'a[href$=".wav"]',
+            'a[href$=".m4a"]',
+
+            
+
+            # Text-based file extension detection (for links where filename is in text)
+
+            'a:has-text(".zip")',
+
+            'a:has-text(".pdf")',
+
+            'a:has-text(".xlsx")',
+
+            'a:has-text(".docx")',
+
+            'a:has-text(".mp4")',
+
+            'a:has-text(".mp3")',
+
+            # ID/Class based (specific to download)
+            'button[id*="download" i]',
+            'a[id*="download" i]',
+            'button[class*="download" i]',
+            'a[class*="download" i]',
+
+            # Portal-specific selectors
+            '.document-link',
+            '.file-link',
+            'a[href*="/documents/download"]',
+            'a[href*="/files/download"]',
+            'a[href*="/media/download"]',
+
+            # NextRequest-specific (documents in request pages)
+            'a[href*="/documents/"][href*="."]',  # Links with /documents/ and a file extension
+        ]
+
+        for selector in selectors:
+            try:
+                elements = page.locator(selector).all()
+                for element in elements:
+                    try:
+                        if element.is_visible():
+                            href = element.get_attribute('href') if element.get_attribute('href') else None
+                            text = element.inner_text() if element.inner_text() else ''
+
+                            # Filtering - skip obvious navigation but keep download links
+                            skip_keywords = [
+                                'back', 'home', 'logout', 'sign out', 'sign in',
+                                'next page', 'previous page', 'first page', 'last page',
+                                'profile', 'settings', 'account settings', 'help', 'support',
+                                'view request', 'view all requests', 'edit', 'delete', 'cancel'
+                            ]
+
+                            # Check text for skip keywords (but be specific - "next" alone shouldn't skip if it's not "next page")
+                            if text:
+                                text_lower = text.lower().strip()
+                                should_skip = False
+                                for skip in skip_keywords:
+                                    if skip in text_lower and skip == text_lower:
+                                        # Exact match or very close match
+                                        should_skip = True
+                                        break
+                                if should_skip:
+                                    continue
+
+                            # Skip if href contains navigation keywords (but NOT /documents/ or /files/)
+                            if href:
+                                href_lower = href.lower()
+                                # Skip profile/settings pages
+                                if any(skip in href_lower for skip in ['/profile', '/account', '/settings', '/logout']):
+                                    continue
+                                # Don't skip /requests/ - that's the page we're on!
+                                # Don't skip /documents/ or /files/ - those are downloads!
+
+                            download_elements.append({
+                                'element': selector,
+                                'href': href,
+                                'text': text[:50] if text else 'No text'
+                            })
+                    except:
+                        pass
+            except:
+                pass
+
+        return download_elements
+
+    def _download_single_element(self, page, element_info: Dict, download_path: str, index: int) -> Optional[str]:
+        """Download a single file by clicking an element with proper timeout handling"""
+        try:
+            selector = element_info['element']
+            href = element_info.get('href')
+
+            # If there's a direct href, try downloading
+            if href and not href.startswith('javascript:'):
+                try:
+                    # Use a proper timeout and catch the exception
+                    with page.expect_download(timeout=30000) as download_info:
+                        # Try to click the specific element
+                        if href:
+                            elements = page.locator(f"{selector}[href='{href}']").all()
+                            if elements:
+                                elements[0].click(timeout=5000)
+                            else:
+                                page.locator(selector).first.click(timeout=5000)
+                        else:
+                            page.locator(selector).first.click(timeout=5000)
+
+                    download = download_info.value
+                    filename = download.suggested_filename or f"file_{index}"
+                    filepath = os.path.join(download_path, filename)
+                    download.save_as(filepath)
+                    return filepath
+                except PlaywrightTimeout:
+                    logger.debug(f"Download timeout for {href} - no download triggered")
+                    return None
+                except Exception as e:
+                    logger.debug(f"Download failed for {href}: {e}")
+                    return None
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Error downloading element: {e}")
+            return None
+
+    def _is_login_page(self, page) -> bool:
+        """Check if current page is a login page"""
+        login_indicators = [
+            'input[type="password"]',
+            'input[name*="password"]',
+            'input[id*="password"]',
+            'button:has-text("Sign in")',
+            'button:has-text("Log in")',
+            'button:has-text("Login")'
+        ]
+
+        for indicator in login_indicators:
+            try:
+                if page.locator(indicator).count() > 0:
+                    return True
+            except:
+                pass
+
+        return False
+
+    def _handle_login_flow(self, page, login_creds: str) -> bool:
+        """
+        Smart login flow that handles:
+        1. Pages with 'Sign in' buttons that lead to login forms
+        2. Direct login forms
+        3. Pages with access restrictions
+        """
+        try:
+            # First, check if there's a "Sign in" or "Create account" button (not in a form yet)
+            signin_button_selectors = [
+                'button:has-text("Sign in"):not([type="submit"])',
+                'a:has-text("Sign in")',
+                'button:has-text("Log in"):not([type="submit"])',
+                'a:has-text("Log in")',
+                'a[href*="sign_in"]',
+                'a[href*="login"]'
+            ]
+
+            # Try to click a signin button first
+            for selector in signin_button_selectors:
+                try:
+                    if page.locator(selector).count() > 0:
+                        logger.info(f'Found sign-in button, clicking: {selector}')
+                        page.click(selector, timeout=5000)
+                        page.wait_for_timeout(3000)
+                        break
+                except:
+                    pass
+
+            # Now check if we have a login form to fill
+            if self._is_login_page(page):
+                logger.info("Login form detected, attempting to log in")
+                return self._handle_login(page, login_creds)
+            else:
+                # Check if page indicates restricted access but we might already be logged in
+                # or doesn't need login
+                restricted_indicators = [
+                    'text=Access to this request is currently limited',
+                    'text=Access is limited',
+                    'text=restricted',
+                    'text=You must be logged in'
+                ]
+
+                has_restriction = False
+                for indicator in restricted_indicators:
+                    try:
+                        if page.locator(indicator).count() > 0:
+                            has_restriction = True
+                            logger.warning(f'Page shows access restriction: {indicator}')
+                            break
+                    except:
+                        pass
+
+                if has_restriction:
+                    # Page says access is restricted but no login form found
+                    logger.error('Access is restricted but no login form found')
+                    return False
+                else:
+                    # No login form and no restriction message - assume we're good
+                    logger.info('No login form found, assuming access is already granted or not needed')
+                    return True
+
+        except Exception as e:
+            logger.error(f'Error in login flow: {e}')
+            import traceback
+            traceback.print_exc()
+            return False
+    def _parse_credentials(self, login_creds: str) -> tuple:
+        """
+        Intelligently parse login credentials from various formats
+        """
+        # Try to find email/username and password patterns
+        email_patterns = [
+            r'(?:username|user|email|login)[:\s]+([^\s\n]+)',
+            r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        ]
+
+        password_patterns = [
+            r'(?:password|pass|pwd)[:\s]+([^\s\n]+)',
+        ]
+
+        username = None
+        password = None
+
+        for pattern in email_patterns:
+            match = re.search(pattern, login_creds, re.IGNORECASE)
+            if match:
+                username = match.group(1)
+                break
+
+        for pattern in password_patterns:
+            match = re.search(pattern, login_creds, re.IGNORECASE)
+            if match:
+                password = match.group(1)
+                break
+
+        if not username and ':' in login_creds and '\n' not in login_creds:
+            parts = login_creds.split(':', 1)
+            username = parts[0].strip()
+            password = parts[1].strip() if len(parts) > 1 else ''
+
+        if not username:
+            username = login_creds.strip()
+
+        logger.info(f'Parsed credentials - Username: {username}, Has password: {bool(password)}')
+        return username, password or ''
+
+    def _handle_login(self, page, login_creds: str) -> bool:
+        """Handle login using credentials"""
+        try:
+            username, password = self._parse_credentials(login_creds)
+
+            if not username:
+                logger.error('No username found in credentials')
+                return False
+
+            logger.info(f'Attempting login with username: {username}')
+
+            email_selectors = [
+                'input[type="email"]',
+                'input[type="text"]',
+                'input[name*="email"]',
+                'input[name*="user"]',
+                'input[id*="email"]',
+                'input[id*="user"]',
+                'input[name="username"]',
+                'input[id="username"]'
+            ]
+
+            filled = False
+            for selector in email_selectors:
+                try:
+                    if page.locator(selector).count() > 0:
+                        page.fill(selector, username, timeout=5000)
+                        logger.info(f'Filled username field with selector: {selector}')
+                        filled = True
+                        break
+                except:
+                    pass
+
+            if not filled:
+                logger.warning('Could not find email/username field')
+                return False
+
+            if password:
+                try:
+                    password_selector = 'input[type="password"]'
+                    if page.locator(password_selector).count() > 0:
+                        page.fill(password_selector, password, timeout=5000)
+                        logger.info('Filled password field')
+                    else:
+                        logger.warning('No password field found')
+                except Exception as e:
+                    logger.warning(f'Could not fill password field: {e}')
+
+            submit_selectors = [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("Sign in")',
+                'button:has-text("Log in")',
+                'button:has-text("Login")',
+                'button:has-text("Submit")',
+                'button:has-text("Continue")',
+                'button:has-text("Next")',
+                'a:has-text("Sign in")'
+            ]
+
+            for selector in submit_selectors:
+                try:
+                    if page.locator(selector).count() > 0:
+                        page.click(selector, timeout=5000)
+                        page.wait_for_timeout(5000)
+                        logger.info(f'Clicked submit button with selector: {selector}')
+                        return True
+                except:
+                    pass
+
+            logger.warning('Could not find submit button')
+            return False
+
+        except Exception as e:
+            logger.error(f'Error handling login: {e}')
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _get_filename_from_response(self, response, url: str) -> str:
+        """Extract filename from response headers or URL"""
+        if 'Content-Disposition' in response.headers:
+            content_disp = response.headers['Content-Disposition']
+            if 'filename=' in content_disp:
+                filename = content_disp.split('filename=')[1].strip('"')
+                return unquote(filename)
+
+        parsed_url = urlparse(url)
+        filename = os.path.basename(parsed_url.path)
+
+        if not filename or filename == '':
+            timestamp = int(time.time())
+            filename = f"download_{timestamp}.bin"
+
+        return filename
+
+    def _is_direct_download_url(self, url: str) -> bool:
+        """Check if URL is likely a direct download link"""
+        # Evidence.com direct download patterns
+        direct_download_patterns = [
+            'action=downloadpkg',
+            'action=download',
+            '/download/',
+            '/downloads/',
+            'download.php',
+            'download.aspx',
+        ]
+
+        url_lower = url.lower()
+        return any(pattern in url_lower for pattern in direct_download_patterns)
+
+    def _handle_auto_download(self, page, url: str, download_path: str) -> Optional[str]:
+        """Handle automatic download that triggers on page navigation"""
+        try:
+            # Set up download listener before navigating
+            with page.expect_download(timeout=60000) as download_info:
+                page.goto(url, wait_until='load', timeout=60000)
+
+            download = download_info.value
+            filename = download.suggested_filename or f"auto_download_{int(time.time())}"
+            filepath = os.path.join(download_path, filename)
+            download.save_as(filepath)
+
+            logger.info(f"Auto-downloaded: {filename}")
+            return filepath
+
+        except PlaywrightTimeout:
+            logger.debug("Auto-download timeout - no automatic download triggered")
+            return None
+        except Exception as e:
+            logger.debug(f"Auto-download failed: {e}")
+            return None

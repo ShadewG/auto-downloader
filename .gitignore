@@ -1,0 +1,43 @@
+# Environment variables and secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Downloaded files and artifacts
+downloads/
+*.zip
+*.pdf
+*.mp4
+*.avi
+*.mov
+
+# Logs
+*.log
+logs/
+
+# Notion and Dropbox tokens
+.notion_token
+.dropbox_token
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+test_*.py
+*_test.py
