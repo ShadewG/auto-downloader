@@ -49,8 +49,8 @@ class FileDownloader:
             logger.info("Detected Google Drive URL")
             return self._google_drive_download(url, case_download_path)
 
-        # Try Skyvern FIRST for portal pages (PRIMARY METHOD with Gemini 2.5 Flash)
-        logger.info(f"Attempting download with Skyvern (Gemini 2.5 Flash) for: {url}")
+        # Try Skyvern FIRST for portal pages (PRIMARY METHOD with Claude Sonnet 3.5)
+        logger.info(f"Attempting download with Skyvern (Claude Sonnet 3.5) for: {url}")
 
         # Parse credentials if provided
         username = None

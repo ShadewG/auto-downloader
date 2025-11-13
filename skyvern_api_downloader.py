@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Skyvern API-based downloader module
+Skyvern API-based downloader module - FIXED VERSION
 
 This module uses the Skyvern REST API to navigate and download files.
 Skyvern runs as a Docker service and we interact with it via HTTP requests.
+
+FIXED: Filter out Skyvern's own navigation screenshots (ai_nav_step_*.png)
 """
 
 import os
@@ -17,6 +19,37 @@ logger = logging.getLogger(__name__)
 
 SKYVERN_API_BASE = "http://localhost:8000/api/v1"
 SKYVERN_API_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc5MzY4NDcsInN1YiI6Im9fNDYwODIyNzA2MTQ3NzI4MTE4In0.a81nQ5EZV5xcE942hWfzkU-3Z7Kwqc31ypgahKKithI"
+
+
+def is_evidence_file(filename: str) -> bool:
+    """
+    Check if a file is actually an evidence file (not a Skyvern screenshot)
+
+    Returns True if file looks like evidence, False if it's a Skyvern artifact
+    """
+    filename_lower = filename.lower()
+
+    # Filter out Skyvern's own screenshots
+    if filename_lower.startswith("ai_nav_step_") and filename_lower.endswith(".png"):
+        return False
+
+    # Filter out other Skyvern artifacts
+    if filename_lower.startswith("recording_") and filename_lower.endswith((".webm", ".mp4")):
+        return False
+
+    # Accept common evidence file types
+    evidence_extensions = [
+        '.pdf', '.doc', '.docx', '.txt', '.rtf',  # Documents
+        '.zip', '.7z', '.rar', '.tar', '.gz',      # Archives
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff',  # Images (non-screenshot)
+        '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv',  # Videos
+        '.mp3', '.wav', '.m4a', '.flac',  # Audio
+        '.xls', '.xlsx', '.csv',  # Spreadsheets
+        '.ppt', '.pptx',  # Presentations
+        '.eml', '.msg',  # Emails
+    ]
+
+    return any(filename_lower.endswith(ext) for ext in evidence_extensions)
 
 
 def download_with_skyvern_api(
@@ -49,7 +82,7 @@ def download_with_skyvern_api(
         # Build the task prompt
         if username and password:
             navigation_goal = f"""
-Navigate to this evidence portal and download the files.
+Navigate to this evidence portal and download ALL the evidence files.
 
 Steps:
 1. If you see a login page:
@@ -57,20 +90,22 @@ Steps:
    - Enter password: {password}
    - Click the login/submit button
 2. After logging in (or if no login needed):
-   - Look for a "Files", "Documents", or "Attachments" section
+   - Look for a "Files", "Documents", "Attachments", or "Evidence" section
    - Navigate there if needed
-   - Find and click the Download button (might say "Download", "Download All", etc.)
-   - Wait for downloads to complete
+   - Find the Download button or link (might say "Download", "Download All", "Download Files", "Export", etc.)
+   - IMPORTANT: Click the download button to actually download the files
+   - Wait for the browser's download to complete (check for download progress indicators)
+3. Make sure files are actually downloading - not just viewing or listing them
 """
         else:
             navigation_goal = """
-Navigate to this evidence portal and download the files.
+Navigate to this evidence portal and download ALL the evidence files.
 
 Steps:
-1. Look for a "Files", "Documents", or "Attachments" section and navigate there if needed
-2. Find the download button or link (labeled "Download", "Download All", or similar)
-3. Click it to download the files
-4. Wait for downloads to complete
+1. Look for a "Files", "Documents", "Attachments", or "Evidence" section and navigate there if needed
+2. Find the download button or link (labeled "Download", "Download All", "Download Files", "Export", or similar)
+3. IMPORTANT: Click it to actually download the files (not just view them)
+4. Wait for the browser's download to complete (check for download progress indicators)
 """
 
         # Create navigation payload
@@ -172,6 +207,11 @@ Steps:
                                 filename = artifact.get("uri", f"download_{artifact_id}")
                                 filepath = Path(download_path) / Path(filename).name
 
+                                # Check if this is an evidence file
+                                if not is_evidence_file(filepath.name):
+                                    logger.info(f"Skipping Skyvern artifact: {filepath.name}")
+                                    continue
+
                                 with open(filepath, 'wb') as f:
                                     for chunk in file_response.iter_content(chunk_size=8192):
                                         f.write(chunk)
@@ -181,32 +221,43 @@ Steps:
                                 downloaded_files += 1
 
                     if downloaded_files > 0:
-                        logger.info(f"Successfully downloaded {downloaded_files} file(s) with Skyvern")
+                        logger.info(f"Successfully downloaded {downloaded_files} evidence file(s) with Skyvern")
                         return True
 
-                # Check if files exist in download directory
+                # Check if files exist in download directory (filter out screenshots)
                 # (Skyvern might save directly to configured download path)
-                files = list(Path(download_path).glob("*"))
-                if files:
-                    logger.info(f"Successfully downloaded {len(files)} file(s) with Skyvern:")
-                    for f in files:
+                all_files = list(Path(download_path).glob("*"))
+                evidence_files = [f for f in all_files if f.is_file() and is_evidence_file(f.name)]
+
+                if evidence_files:
+                    logger.info(f"Successfully downloaded {len(evidence_files)} evidence file(s) with Skyvern:")
+                    for f in evidence_files:
                         size_mb = f.stat().st_size / 1024 / 1024
                         logger.info(f"  - {f.name} ({size_mb:.2f} MB)")
+
+                    # Clean up Skyvern screenshots
+                    for f in all_files:
+                        if f.is_file() and not is_evidence_file(f.name):
+                            logger.info(f"Removing Skyvern artifact: {f.name}")
+                            f.unlink()
+
                     return True
 
                 # Check Skyvern's actual downloads directory (volume mounted)
-                skyvern_download_dir = Path("/mnt/HC_Volume_103781006/skyvern/downloads") / task_id
+                skyvern_download_dir = Path("/root/skyvern/downloads") / task_id
                 if skyvern_download_dir.exists():
-                    files = list(skyvern_download_dir.glob("*"))
-                    if files:
-                        logger.info(f"Successfully downloaded {len(files)} file(s) with Skyvern:")
-                        for f in files:
+                    all_files = list(skyvern_download_dir.glob("*"))
+                    evidence_files = [f for f in all_files if f.is_file() and is_evidence_file(f.name)]
+
+                    if evidence_files:
+                        logger.info(f"Successfully downloaded {len(evidence_files)} evidence file(s) with Skyvern:")
+                        for f in evidence_files:
                             size_mb = f.stat().st_size / 1024 / 1024
                             logger.info(f"  - {f.name} ({size_mb:.2f} MB)")
 
-                        # Copy files to the requested download_path
+                        # Copy evidence files to the requested download_path
                         Path(download_path).mkdir(parents=True, exist_ok=True)
-                        for f in files:
+                        for f in evidence_files:
                             dest = Path(download_path) / f.name
                             logger.info(f"Copying {f.name} to {download_path}")
                             import shutil
@@ -214,7 +265,8 @@ Steps:
 
                         return True
 
-                logger.warning("Skyvern task completed but no files found")
+                logger.warning("Skyvern task completed but no evidence files found (only screenshots)")
+                logger.warning("Skyvern may have navigated the portal but didn't actually download files")
                 return False
 
             elif status in ["failed", "error"]:
