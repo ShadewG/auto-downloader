@@ -21,35 +21,36 @@ SKYVERN_API_BASE = "http://localhost:8000/api/v1"
 SKYVERN_API_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc5MzY4NDcsInN1YiI6Im9fNDYwODIyNzA2MTQ3NzI4MTE4In0.a81nQ5EZV5xcE942hWfzkU-3Z7Kwqc31ypgahKKithI"
 
 
+def _skyvern_artifact_reason(filename: str) -> Optional[str]:
+    """Return a reason when filename is a known Skyvern-generated artifact."""
+    name = filename.lower()
+
+    if name.startswith("ai_nav_step_") and name.endswith(".png"):
+        return "Skyvern navigation screenshot"
+
+    if name.startswith("recording_") and name.endswith((".webm", ".mp4")):
+        return "Skyvern session recording"
+
+    if name.endswith("browser_console.log"):
+        return "Browser console log"
+
+    if name.endswith("browser_network.log"):
+        return "Browser network log"
+
+    if name.endswith("trace.zip") and "playwright" in name:
+        return "Playwright trace archive"
+
+    return None
+
+
 def is_evidence_file(filename: str) -> bool:
-    """
-    Check if a file is actually an evidence file (not a Skyvern screenshot)
-
-    Returns True if file looks like evidence, False if it's a Skyvern artifact
-    """
-    filename_lower = filename.lower()
-
-    # Filter out Skyvern's own screenshots
-    if filename_lower.startswith("ai_nav_step_") and filename_lower.endswith(".png"):
+    """Return True for evidence files; False for known Skyvern artifacts."""
+    reason = _skyvern_artifact_reason(filename)
+    if reason:
+        logger.debug(f"Skipping {filename}: {reason}")
         return False
 
-    # Filter out other Skyvern artifacts
-    if filename_lower.startswith("recording_") and filename_lower.endswith((".webm", ".mp4")):
-        return False
-
-    # Accept common evidence file types
-    evidence_extensions = [
-        '.pdf', '.doc', '.docx', '.txt', '.rtf',  # Documents
-        '.zip', '.7z', '.rar', '.tar', '.gz',      # Archives
-        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff',  # Images (non-screenshot)
-        '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv',  # Videos
-        '.mp3', '.wav', '.m4a', '.flac',  # Audio
-        '.xls', '.xlsx', '.csv',  # Spreadsheets
-        '.ppt', '.pptx',  # Presentations
-        '.eml', '.msg',  # Emails
-    ]
-
-    return any(filename_lower.endswith(ext) for ext in evidence_extensions)
+    return True
 
 
 def download_with_skyvern_api(
@@ -174,6 +175,13 @@ Steps:
             if status in ["completed", "success", "terminated"]:
                 logger.info(f"Skyvern task finished with status: {status}")
 
+                failure_reason = task_status.get("failure_reason")
+                if failure_reason:
+                    logger.warning(f"Skyvern reported reason: {failure_reason}")
+                    reason_lower = failure_reason.lower()
+                    if any(keyword in reason_lower for keyword in ["login", "session", "credential"]):
+                        logger.warning("Skyvern likely hit an authentication wall (session expired or login page)")
+
                 # Check for downloaded artifacts
                 # Skyvern stores artifacts in the configured artifact path
                 # We need to check if any files were downloaded
@@ -265,7 +273,10 @@ Steps:
 
                         return True
 
-                logger.warning("Skyvern task completed but no evidence files found (only screenshots)")
+                logger.warning("Skyvern task completed but no evidence files found (only artifacts)")
+                failure_reason = task_status.get("failure_reason")
+                if failure_reason:
+                    logger.warning(f"Skyvern failure reason: {failure_reason}")
                 logger.warning("Skyvern may have navigated the portal but didn't actually download files")
                 return False
 
