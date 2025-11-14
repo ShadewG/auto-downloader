@@ -25,7 +25,7 @@ SKYVERN_API_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc5MzY4ND
 SKYVERN_DOWNLOAD_ROOT = Path(
     os.environ.get("SKYVERN_DOWNLOAD_ROOT", "/mnt/HC_Volume_103781006/skyvern/downloads")
 )
-SKYVERN_MAX_STEPS = int(os.environ.get("SKYVERN_MAX_STEPS", "60"))
+SKYVERN_MAX_STEPS = int(os.environ.get("SKYVERN_MAX_STEPS", "20"))
 FINAL_TASK_STATUSES = {"completed", "success", "terminated", "failed", "error"}
 FAILURE_STATUSES = {"failed", "error"}
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
@@ -346,30 +346,36 @@ def download_with_skyvern_api(
             navigation_goal = f"""
 Navigate to this evidence portal and download ALL the evidence files.
 
+CRITICAL INSTRUCTION: Click each Download button ONLY ONCE. After clicking, the browser 
+will download files in the background even if the button remains visible on the page.
+
 Steps:
-1. If you see a login page:
-   - Enter username: {username}
-   - Enter password: {password}
-   - Click the login/submit button
-2. After logging in (or if no login needed):
-   - Look for a "Files", "Documents", "Attachments", or "Evidence" section
-   - Navigate there if needed
-   - Find the Download button or link (might say "Download", "Download All", "Download Files", "Export", etc.)
-   - IMPORTANT: Click the download button to actually download the files
-   - Wait for the browser's download to complete (check for download progress indicators)
-3. Trigger each download only once. Do not repeatedly click the same button after it starts.
-4. As soon as downloads are running (progress/download indicator visible), stop interacting with the page and end the task so the files can finish downloading.
+1. Login with provided credentials:
+   - Username: {username}
+   - Password: {password}
+   - Click login/submit button
+2. After logging in:
+   - Look for Files/Documents/Evidence section
+   - If there is a "Download All" or "Download" button: Click it ONCE only
+   - If each file has individual download buttons: Click each file's download button ONCE only
+3. After clicking download button(s), IMMEDIATELY complete the task
+   - Do NOT click the same download button again even if it stays visible
+   - The downloads will continue in the browser background
 """
         else:
             navigation_goal = """
 Navigate to this evidence portal and download ALL the evidence files.
 
+CRITICAL INSTRUCTION: Click each Download button ONLY ONCE. After clicking, the browser 
+will download files in the background even if the button remains visible on the page.
+
 Steps:
-1. Look for a "Files", "Documents", "Attachments", or "Evidence" section and navigate there if needed
-2. Find the download button or link (labeled "Download", "Download All", "Download Files", "Export", or similar)
-3. IMPORTANT: Click it to actually download the files (not just view them)
-4. Trigger each download only once unless it clearly fails.
-5. As soon as downloads begin, stop navigating and end the task so the browser can finish downloading everything in the background.
+1. Look for Files/Documents/Evidence section
+2. If there is a "Download All" or "Download" button: Click it ONCE only
+3. If each file has individual download buttons: Click each file's download button ONCE only
+4. After clicking download button(s), IMMEDIATELY complete the task
+   - Do NOT click the same download button again even if it stays visible
+   - The downloads will continue in the browser background
 """
 
         # Create navigation payload with increased max_steps for complex portals
@@ -386,7 +392,8 @@ Steps:
             "totp_verification_url": None,
             "totp_identifier": None,
             "error_code_mapping": None,
-            "max_steps_per_run": SKYVERN_MAX_STEPS
+            "max_steps_per_run": SKYVERN_MAX_STEPS,
+            "complete_criterion": "Complete the task immediately after clicking the Download button, even if the button remains visible on the page. The browser will continue downloading files in the background."
         }
 
         logger.info("Creating Skyvern task...")
