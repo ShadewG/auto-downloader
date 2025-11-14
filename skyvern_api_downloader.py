@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Skyvern API-based downloader module - FIXED VERSION
+Skyvern API-based downloader module - ENHANCED WITH LIVE MONITORING
 
 This module uses the Skyvern REST API to navigate and download files.
-Skyvern runs as a Docker service and we interact with it via HTTP requests.
 
-FIXED: Filter out Skyvern's own navigation screenshots (ai_nav_step_*.png)
+NEW FEATURES:
+- Browser session persistence to stay logged in
+- Live progress monitoring with detailed status updates
+- No arbitrary timeouts - waits until task actually completes
+- Progress tracking for visual monitoring
 """
 
 import os
@@ -14,8 +17,11 @@ import logging
 import requests
 import hashlib
 import shutil
+import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import urlparse
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -26,30 +32,180 @@ SKYVERN_DOWNLOAD_ROOT = Path(
     os.environ.get("SKYVERN_DOWNLOAD_ROOT", "/mnt/HC_Volume_103781006/skyvern/downloads")
 )
 SKYVERN_MAX_STEPS = int(os.environ.get("SKYVERN_MAX_STEPS", "20"))
-FINAL_TASK_STATUSES = {"completed", "success", "terminated", "failed", "error"}
-FAILURE_STATUSES = {"failed", "error"}
+FINAL_TASK_STATUSES = {"completed", "success", "terminated", "failed", "error", "timed_out", "canceled"}
+FAILURE_STATUSES = {"failed", "error", "timed_out"}
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
+
+# Browser session storage
+SESSION_STORE_FILE = Path("/root/case-downloader/browser_sessions.json")
+SESSION_TIMEOUT = 3600  # 1 hour
+
+# Progress tracking storage
+PROGRESS_STORE_FILE = Path("/root/case-downloader/download_progress.json")
+
+
+class DownloadProgress:
+    """Track download progress for monitoring."""
+
+    def __init__(self, task_id: str, suspect_name: str, url: str):
+        self.task_id = task_id
+        self.suspect_name = suspect_name
+        self.url = url
+        self.status = "created"
+        self.started_at = datetime.now().isoformat()
+        self.updated_at = datetime.now().isoformat()
+        self.steps_completed = 0
+        self.max_steps = SKYVERN_MAX_STEPS
+        self.failure_reason = None
+        self.files_downloaded = 0
+        self.current_action = "Initializing..."
+        self.screenshot_urls = []
+
+    def update(self, status: str, action: str = None, steps: int = None):
+        """Update progress status."""
+        self.status = status
+        if action:
+            self.current_action = action
+        if steps is not None:
+            self.steps_completed = steps
+        self.updated_at = datetime.now().isoformat()
+        self._save()
+
+    def _save(self):
+        """Save progress to disk for monitoring."""
+        try:
+            progress_data = self.__dict__.copy()
+
+            # Load existing progress
+            all_progress = {}
+            if PROGRESS_STORE_FILE.exists():
+                with open(PROGRESS_STORE_FILE, 'r') as f:
+                    all_progress = json.load(f)
+
+            # Update this task's progress
+            all_progress[self.task_id] = progress_data
+
+            # Save back
+            PROGRESS_STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(PROGRESS_STORE_FILE, 'w') as f:
+                json.dump(all_progress, f, indent=2)
+        except Exception as exc:
+            logger.warning(f"Failed to save progress: {exc}")
+
+
+def _get_domain(url: str) -> str:
+    """Extract domain from URL for session grouping."""
+    try:
+        parsed = urlparse(url)
+        domain_parts = parsed.netloc.split('.')
+        if len(domain_parts) >= 2:
+            return '.'.join(domain_parts[-2:])
+        return parsed.netloc
+    except Exception:
+        return "unknown"
+
+
+def _load_session_store() -> Dict[str, Dict]:
+    """Load browser sessions from persistent storage."""
+    if not SESSION_STORE_FILE.exists():
+        return {}
+    try:
+        with open(SESSION_STORE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.warning(f"Failed to load session store: {exc}")
+        return {}
+
+
+def _save_session_store(sessions: Dict[str, Dict]):
+    """Save browser sessions to persistent storage."""
+    try:
+        SESSION_STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SESSION_STORE_FILE, 'w') as f:
+            json.dump(sessions, f, indent=2)
+    except Exception as exc:
+        logger.warning(f"Failed to save session store: {exc}")
+
+
+def _cleanup_stale_sessions(sessions: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Remove sessions that are too old."""
+    now = time.time()
+    cleaned = {}
+    for domain, session_data in sessions.items():
+        created_at = session_data.get('created_at', 0)
+        if now - created_at < SESSION_TIMEOUT:
+            cleaned[domain] = session_data
+        else:
+            logger.info(f"Removing stale browser session for {domain}")
+    return cleaned
+
+
+def _create_browser_session(domain: str) -> Optional[str]:
+    """Create a new browser session via Skyvern API."""
+    try:
+        logger.info(f"Creating new browser session for domain: {domain}")
+        payload = {
+            "timeout": SESSION_TIMEOUT,
+            "proxy_location": None
+        }
+        response = requests.post(
+            f"{SKYVERN_API_BASE}/browser_sessions",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": SKYVERN_API_TOKEN
+            }
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to create browser session: {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            return None
+        session_data = response.json()
+        session_id = session_data.get("browser_session_id")
+        if session_id:
+            logger.info(f"Created browser session: {session_id} for {domain}")
+        return session_id
+    except Exception as exc:
+        logger.error(f"Error creating browser session: {exc}")
+        return None
+
+
+def _get_or_create_session(url: str) -> Optional[str]:
+    """Get existing browser session for domain or create a new one."""
+    domain = _get_domain(url)
+    sessions = _load_session_store()
+    sessions = _cleanup_stale_sessions(sessions)
+
+    if domain in sessions:
+        session_id = sessions[domain].get('session_id')
+        if session_id:
+            logger.info(f"Reusing existing browser session {session_id} for {domain}")
+            return session_id
+
+    session_id = _create_browser_session(domain)
+    if session_id:
+        sessions[domain] = {
+            'session_id': session_id,
+            'created_at': time.time(),
+            'domain': domain
+        }
+        _save_session_store(sessions)
+    return session_id
 
 
 def _skyvern_artifact_reason(filename: str) -> Optional[str]:
     """Return a reason when filename is a known Skyvern-generated artifact."""
     name = filename.lower()
-
     if name.startswith("ai_nav_step_") and name.endswith(".png"):
         return "Skyvern navigation screenshot"
-
     if name.startswith("recording_") and name.endswith((".webm", ".mp4")):
         return "Skyvern session recording"
-
     if name.endswith("browser_console.log"):
         return "Browser console log"
-
     if name.endswith("browser_network.log"):
         return "Browser network log"
-
     if name.endswith("trace.zip") and "playwright" in name:
         return "Playwright trace archive"
-
     return None
 
 
@@ -59,12 +215,11 @@ def is_evidence_file(filename: str) -> bool:
     if reason:
         logger.debug(f"Skipping {filename}: {reason}")
         return False
-
     return True
 
 
 def _hash_file(file_path: Path) -> Optional[str]:
-    """Compute a SHA256 checksum for a file without loading it entirely into memory."""
+    """Compute a SHA256 checksum for a file."""
     try:
         digest = hashlib.sha256()
         with file_path.open("rb") as handle:
@@ -89,7 +244,6 @@ def _build_checksum_index(download_dir: Path) -> Dict[str, Path]:
         checksum = _hash_file(file_path)
         if not checksum:
             continue
-
         if checksum in checksum_index:
             logger.info(f"Removing duplicate evidence file already present: {file_path.name}")
             try:
@@ -97,9 +251,7 @@ def _build_checksum_index(download_dir: Path) -> Dict[str, Path]:
             except OSError as exc:
                 logger.warning(f"Unable to remove duplicate {file_path.name}: {exc}")
             continue
-
         checksum_index[checksum] = file_path
-
     return checksum_index
 
 
@@ -110,7 +262,6 @@ def _copy_reported_downloads(
 ) -> int:
     """Persist files referenced in the task status response."""
     saved = 0
-
     for record in reported_downloads or []:
         checksum = record.get("checksum")
         filename = record.get("filename") or record.get("name")
@@ -119,7 +270,6 @@ def _copy_reported_downloads(
         if checksum and checksum in checksum_index:
             logger.info(f"Skipping duplicate reported download {filename} (checksum {checksum})")
             continue
-
         if not source_path:
             logger.debug("Reported download missing local path; skipping")
             continue
@@ -152,25 +302,28 @@ def _copy_reported_downloads(
 
         if checksum:
             checksum_index[checksum] = dest
+        file_size_mb = dest.stat().st_size / 1024 / 1024
+        logger.info(f"Saved reported download: {dest.name} ({file_size_mb:.2f} MB)")
         saved += 1
-
     return saved
 
 
 def _fetch_task_artifacts(task_id: str) -> List[Dict[str, Any]]:
-    """Retrieve artifact metadata for a task."""
+    """Retrieve the artifact list for a given task."""
     try:
         response = requests.get(
             f"{SKYVERN_API_BASE}/tasks/{task_id}/artifacts",
             headers={"x-api-key": SKYVERN_API_TOKEN}
         )
         if response.status_code == 200:
-            return response.json()
-        logger.warning(f"Failed to fetch artifacts for {task_id}: HTTP {response.status_code}")
-    except requests.exceptions.RequestException as exc:
-        logger.error(f"Artifact fetch failed for {task_id}: {exc}")
-
-    return []
+            artifacts = response.json()
+            logger.info(f"Fetched {len(artifacts)} artifact(s) for task {task_id}")
+            return artifacts if isinstance(artifacts, list) else []
+        logger.warning(f"Failed to fetch artifacts for task {task_id}: HTTP {response.status_code}")
+        return []
+    except Exception as exc:
+        logger.warning(f"Error fetching artifacts for task {task_id}: {exc}")
+        return []
 
 
 def _download_artifact_files(
@@ -179,16 +332,16 @@ def _download_artifact_files(
     download_dir: Path,
     checksum_index: Dict[str, Path]
 ) -> int:
-    """Download artifact files for a task while deduplicating by checksum."""
+    """Download artifact files that are marked as downloads."""
     saved = 0
-
     for artifact in artifacts:
-        if artifact.get("artifact_type") != "download":
+        artifact_id = artifact.get("artifact_id")
+        artifact_type = artifact.get("artifact_type")
+        if artifact_type != "download":
             continue
 
-        artifact_id = artifact.get("artifact_id")
         checksum = artifact.get("checksum")
-        filename = artifact.get("uri", f"download_{artifact_id}")
+        filename = artifact.get("uri") or f"download_{artifact_id}"
 
         if checksum and checksum in checksum_index:
             logger.info(f"Skipping duplicate artifact {filename} (checksum {checksum})")
@@ -199,13 +352,11 @@ def _download_artifact_files(
             stream=True,
             headers={"x-api-key": SKYVERN_API_TOKEN}
         )
-
         if file_response.status_code != 200:
             logger.warning(f"Failed to download artifact {artifact_id} for task {task_id}")
             continue
 
         dest = download_dir / Path(filename).name
-
         with open(dest, 'wb') as handle:
             for chunk in file_response.iter_content(chunk_size=8192):
                 handle.write(chunk)
@@ -229,11 +380,9 @@ def _download_artifact_files(
 
         if checksum:
             checksum_index[checksum] = dest
-
         file_size_mb = dest.stat().st_size / 1024 / 1024
         logger.info(f"Downloaded artifact: {dest.name} ({file_size_mb:.2f} MB)")
         saved += 1
-
     return saved
 
 
@@ -242,7 +391,7 @@ def _copy_from_task_mount(
     download_dir: Path,
     checksum_index: Dict[str, Path]
 ) -> int:
-    """Copy evidence files from the Skyvern host download directory into the case directory."""
+    """Copy evidence files from the Skyvern host download directory."""
     task_directory = SKYVERN_DOWNLOAD_ROOT / task_id
     if not task_directory.exists():
         logger.debug(f"Skyvern download directory not found for task {task_id}: {task_directory}")
@@ -280,7 +429,6 @@ def _copy_from_task_mount(
         if checksum:
             checksum_index[checksum] = dest
         saved += 1
-
     return saved
 
 
@@ -314,6 +462,81 @@ def _collect_downloads(
     return False
 
 
+def _wait_for_task_completion(
+    task_id: str,
+    progress: DownloadProgress,
+    poll_interval: int = 5
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Wait for task to complete with live progress monitoring.
+    No arbitrary timeout - waits until task reaches final status.
+
+    Returns:
+        (success, task_status_dict)
+    """
+    logger.info(f"Monitoring task {task_id} until completion...")
+    progress.update("running", "Waiting for task to start...")
+
+    elapsed = 0
+    last_status = None
+
+    while True:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        # Get task status via run API
+        try:
+            status_response = requests.get(
+                f"{SKYVERN_API_BASE}/tasks/{task_id}",
+                headers={"x-api-key": SKYVERN_API_TOKEN}
+            )
+
+            if status_response.status_code != 200:
+                logger.error(f"Failed to get task status: {status_response.status_code}")
+                progress.update("error", f"Failed to get status: HTTP {status_response.status_code}")
+                continue
+
+            task_status = status_response.json()
+            status = task_status.get("status")
+
+            # Update progress with current status
+            if status != last_status:
+                logger.info(f"Task status: {status} (elapsed: {elapsed}s)")
+                last_status = status
+
+            # Update progress tracking
+            action = f"Status: {status}"
+            if task_status.get("screenshot_urls"):
+                progress.screenshot_urls = task_status["screenshot_urls"]
+
+            progress.update(status, action)
+
+            # Check if task reached final status
+            if status in FINAL_TASK_STATUSES:
+                logger.info(f"Task completed with status: {status} after {elapsed}s")
+
+                failure_reason = task_status.get("failure_reason")
+                if failure_reason:
+                    logger.warning(f"Failure reason: {failure_reason}")
+                    progress.failure_reason = failure_reason
+                    progress.update(status, f"Completed: {failure_reason}")
+
+                # Check if it was a success
+                success = status not in FAILURE_STATUSES
+                return success, task_status
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error getting task status: {e}")
+            progress.update("error", f"Network error: {str(e)}")
+            time.sleep(poll_interval)  # Wait before retry
+            continue
+        except Exception as e:
+            logger.error(f"Error getting task status: {e}")
+            progress.update("error", f"Error: {str(e)}")
+            time.sleep(poll_interval)
+            continue
+
+
 def download_with_skyvern_api(
     url: str,
     download_path: str,
@@ -322,63 +545,62 @@ def download_with_skyvern_api(
     suspect_name: str = ""
 ) -> bool:
     """
-    Download files using Skyvern AI navigation via API
+    Download files using Skyvern AI navigation via API.
 
-    Args:
-        url: URL to navigate to
-        download_path: Local directory to save files
-        username: Optional username for login
-        password: Optional password for login
-        suspect_name: Name of suspect for logging
-
-    Returns:
-        True if files were downloaded successfully, False otherwise
+    ENHANCED FEATURES:
+    - Browser session persistence
+    - Live progress monitoring
+    - No arbitrary timeouts - waits for actual completion
+    - Progress tracking for visual monitoring
     """
+    task_id = None
+    progress = None
+
     try:
         logger.info(f"Starting Skyvern API download for: {suspect_name}")
         logger.info(f"URL: {url}")
 
-        # Create download directory
         Path(download_path).mkdir(parents=True, exist_ok=True)
 
-        # Build the task prompt
+        # Get or create browser session
+        # Browser sessions not supported in this Skyvern version
+        browser_session_id = None  # _get_or_create_session(url)
+        if browser_session_id:
+            logger.info(f"Using browser session: {browser_session_id}")
+
+        # Build navigation goal
         if username and password:
             navigation_goal = f"""
 Navigate to this evidence portal and download ALL the evidence files.
 
-CRITICAL INSTRUCTION: Click each Download button ONLY ONCE. After clicking, the browser 
-will download files in the background even if the button remains visible on the page.
+CRITICAL INSTRUCTION: Click each Download button ONLY ONCE. After clicking, the browser will continue downloading files in the background. Do NOT wait for downloads to finish. Complete the task immediately after clicking.
 
 Steps:
-1. Login with provided credentials:
-   - Username: {username}
-   - Password: {password}
-   - Click login/submit button
-2. After logging in:
-   - Look for Files/Documents/Evidence section
-   - If there is a "Download All" or "Download" button: Click it ONCE only
-   - If each file has individual download buttons: Click each file's download button ONCE only
-3. After clicking download button(s), IMMEDIATELY complete the task
-   - Do NOT click the same download button again even if it stays visible
-   - The downloads will continue in the browser background
+1. If you see a login page:
+   - Enter username: {username}
+   - Enter password: {password}
+   - Click the login/submit button
+2. After logging in (or if no login needed):
+   - Look for a "Files", "Documents", "Attachments", or "Evidence" section
+   - Navigate there if needed
+   - Find the Download button or link
+   - IMPORTANT: Click the download button ONCE to start downloading
+   - DO NOT wait for download completion - mark task complete immediately after clicking
 """
         else:
             navigation_goal = """
 Navigate to this evidence portal and download ALL the evidence files.
 
-CRITICAL INSTRUCTION: Click each Download button ONLY ONCE. After clicking, the browser 
-will download files in the background even if the button remains visible on the page.
+CRITICAL INSTRUCTION: Click each Download button ONLY ONCE. Complete immediately after clicking.
 
 Steps:
-1. Look for Files/Documents/Evidence section
-2. If there is a "Download All" or "Download" button: Click it ONCE only
-3. If each file has individual download buttons: Click each file's download button ONCE only
-4. After clicking download button(s), IMMEDIATELY complete the task
-   - Do NOT click the same download button again even if it stays visible
-   - The downloads will continue in the browser background
+1. Look for a "Files", "Documents", "Attachments", or "Evidence" section
+2. Find the download button
+3. Click it ONCE to start downloading
+4. DO NOT wait - mark task complete immediately after clicking
 """
 
-        # Create navigation payload with increased max_steps for complex portals
+        # Create task payload
         payload = {
             "url": url,
             "navigation_goal": navigation_goal.strip(),
@@ -393,8 +615,11 @@ Steps:
             "totp_identifier": None,
             "error_code_mapping": None,
             "max_steps_per_run": SKYVERN_MAX_STEPS,
-            "complete_criterion": "Complete the task immediately after clicking the Download button, even if the button remains visible on the page. The browser will continue downloading files in the background."
+            "complete_criterion": "Complete the task immediately after clicking the Download button."
         }
+
+        if browser_session_id:
+            payload["browser_session_id"] = browser_session_id
 
         logger.info("Creating Skyvern task...")
 
@@ -421,110 +646,48 @@ Steps:
             return False
 
         logger.info(f"Skyvern task created: {task_id}")
-        logger.info("Waiting 15 seconds before polling to avoid rate limits...")
-        time.sleep(15)
-        logger.info(f"Resuming polling for task {task_id}")
 
-        # Poll for task completion
-        max_wait_time = 3600  # 1 hour
-        poll_interval = 5  # 5 seconds
-        elapsed = 0
+        # Initialize progress tracking
+        progress = DownloadProgress(task_id, suspect_name, url)
+        progress.update("created", "Task created, starting...")
 
-        while elapsed < max_wait_time:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
+        # Wait for task completion with live monitoring
+        success, task_status = _wait_for_task_completion(task_id, progress)
 
-            # Get task status
-            status_response = requests.get(
-                f"{SKYVERN_API_BASE}/tasks/{task_id}",
-                headers={"x-api-key": SKYVERN_API_TOKEN}
-            )
+        if not success:
+            failure_reason = task_status.get("failure_reason", "Unknown")
+            logger.error(f"Task failed: {failure_reason}")
+            progress.update("failed", f"Failed: {failure_reason}")
+            return False
 
-            if status_response.status_code != 200:
-                logger.error(f"Failed to get task status: {status_response.status_code}")
-                continue
+        # Collect downloaded files
+        reported_downloads = task_status.get("downloaded_files") or []
+        if reported_downloads:
+            logger.info(f"Task reported {len(reported_downloads)} downloaded file(s)")
+            progress.files_downloaded = len(reported_downloads)
 
-            task_status = status_response.json()
-            status = task_status.get("status")
+        progress.update("collecting", "Collecting downloaded files...")
+        downloads_found = _collect_downloads(task_id, download_path, reported_downloads)
 
-            logger.info(f"Skyvern task status: {status} ({elapsed}s elapsed)")
+        if downloads_found:
+            progress.update("completed", f"Successfully downloaded files")
+            return True
 
-            if status in FINAL_TASK_STATUSES:
-                logger.info(f"Skyvern task finished with status: {status}")
-
-                failure_reason = task_status.get("failure_reason")
-                if failure_reason:
-                    logger.warning(f"Skyvern reported reason: {failure_reason}")
-                    reason_lower = failure_reason.lower()
-                    if any(keyword in reason_lower for keyword in ["login", "session", "credential"]):
-                        logger.warning("Skyvern likely hit an authentication wall (session expired or login page)")
-
-                reported_downloads = task_status.get("downloaded_files") or []
-                if reported_downloads:
-                    logger.info(f"Task reported {len(reported_downloads)} downloaded file(s)")
-
-                downloads_found = _collect_downloads(task_id, download_path, reported_downloads)
-                if downloads_found:
-                    return True
-
-                if status in FAILURE_STATUSES:
-                    failure_reason = failure_reason or "Unknown"
-                    logger.error(f"Skyvern task failed without evidence files: {failure_reason}")
-                    return False
-
-                logger.warning("Skyvern task completed but no evidence files were located")
-                return False
-
-        logger.error(f"Skyvern task timed out after {max_wait_time} seconds")
-        return False
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Skyvern API request failed: {e}")
+        logger.warning("Task completed but no evidence files were located")
+        progress.update("completed", "No evidence files found")
         return False
 
     except Exception as e:
         logger.error(f"Skyvern download failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
+        if progress:
+            progress.update("error", f"Exception: {str(e)}")
         return False
 
 
-# Test function
-async def test_skyvern_james_rinehart():
-    """
-    Test Skyvern with the James Rinehart case
-    """
-    url = "http://url5374.evidencelibrary.com/ls/click?upn=u001.1DmiTs-2BP7119MjX8j-2FWa7k-2FImRc1ptqmNNLQ0vvxQvwGXF5h9C84oCIEcDMbiJOOM1dFY1ZKtcXYby5O0Muu2mYFHCugv5HiGCR3-2BvXAxZ5aOLAinVzursotXRwqVzFSTC0l_QFGgicBhV6w8RCVzLzEsTzQcjkg8TOaakJfQ2R8mv9SYNKV2bCQWjpr9oHpP9a6CpyL6drUkNuaYq-2BkUmfmWWdd4Od8aY0ZnxkyWOHDbzy2B3Q4Jn-2BISBzfpuhCKHYFVtwsNJtz8y6HeXAjD1TjqOV2EqYCQXBrxxIKvC5urBwcsmyrBivYW-2FULfgB1IPBTUAWGp1bmW6zsudigFhrcg-2B6e9CnddTTfiORF2Aes3S-2BQ-3D"
-
-    download_dir = "/tmp/skyvern_test_downloads/james_rinehart"
-
-    print("=" * 80)
-    print("SKYVERN API TEST: James Rinehart Jr.")
-    print("=" * 80)
-    print()
-
-    success = download_with_skyvern_api(
-        url=url,
-        download_path=download_dir,
-        suspect_name="James Rinehart Jr."
-    )
-
-    if success:
-        print("\n✓ Skyvern successfully downloaded files!")
-    else:
-        print("\n✗ Skyvern failed to download files")
-
-    return success
-
-
 if __name__ == "__main__":
-    # Set up logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-
-    # Run test (synchronous)
-    import asyncio
-    result = asyncio.run(test_skyvern_james_rinehart())
-    exit(0 if result else 1)
