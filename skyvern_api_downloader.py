@@ -12,13 +12,23 @@ import os
 import time
 import logging
 import requests
+import hashlib
+import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
 SKYVERN_API_BASE = "http://localhost:8000/api/v1"
 SKYVERN_API_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc5MzY4NDcsInN1YiI6Im9fNDYwODIyNzA2MTQ3NzI4MTE4In0.a81nQ5EZV5xcE942hWfzkU-3Z7Kwqc31ypgahKKithI"
+
+SKYVERN_DOWNLOAD_ROOT = Path(
+    os.environ.get("SKYVERN_DOWNLOAD_ROOT", "/mnt/HC_Volume_103781006/skyvern/downloads")
+)
+SKYVERN_MAX_STEPS = int(os.environ.get("SKYVERN_MAX_STEPS", "60"))
+FINAL_TASK_STATUSES = {"completed", "success", "terminated", "failed", "error"}
+FAILURE_STATUSES = {"failed", "error"}
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 def _skyvern_artifact_reason(filename: str) -> Optional[str]:
@@ -51,6 +61,257 @@ def is_evidence_file(filename: str) -> bool:
         return False
 
     return True
+
+
+def _hash_file(file_path: Path) -> Optional[str]:
+    """Compute a SHA256 checksum for a file without loading it entirely into memory."""
+    try:
+        digest = hashlib.sha256()
+        with file_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError as exc:
+        logger.warning(f"Unable to hash {file_path}: {exc}")
+        return None
+
+
+def _build_checksum_index(download_dir: Path) -> Dict[str, Path]:
+    """Index existing evidence files by checksum and drop duplicates."""
+    download_dir.mkdir(parents=True, exist_ok=True)
+    checksum_index: Dict[str, Path] = {}
+    files = [f for f in download_dir.iterdir() if f.is_file() and is_evidence_file(f.name)]
+
+    for file_path in files:
+        checksum = _hash_file(file_path)
+        if not checksum:
+            continue
+
+        if checksum in checksum_index:
+            logger.info(f"Removing duplicate evidence file already present: {file_path.name}")
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                logger.warning(f"Unable to remove duplicate {file_path.name}: {exc}")
+            continue
+
+        checksum_index[checksum] = file_path
+
+    return checksum_index
+
+
+def _copy_reported_downloads(
+    reported_downloads: List[Dict[str, Any]],
+    download_dir: Path,
+    checksum_index: Dict[str, Path]
+) -> int:
+    """Persist files referenced in the task status response."""
+    saved = 0
+
+    for record in reported_downloads or []:
+        checksum = record.get("checksum")
+        filename = record.get("filename") or record.get("name")
+        source_path = record.get("filesystem_path") or record.get("local_path") or record.get("path")
+
+        if checksum and checksum in checksum_index:
+            logger.info(f"Skipping duplicate reported download {filename} (checksum {checksum})")
+            continue
+
+        if not source_path:
+            logger.debug("Reported download missing local path; skipping")
+            continue
+
+        src = Path(source_path)
+        if not src.exists():
+            logger.debug(f"Reported download path does not exist: {source_path}")
+            continue
+
+        target_name = filename or src.name
+        dest = download_dir / target_name
+
+        if src.resolve() == dest.resolve():
+            logger.debug(f"Reported download already present at destination: {dest}")
+        else:
+            try:
+                shutil.copy2(src, dest)
+            except OSError as exc:
+                logger.warning(f"Failed to copy reported download {target_name}: {exc}")
+                continue
+
+        checksum = checksum or _hash_file(dest)
+        if checksum and checksum in checksum_index:
+            logger.info(f"Removing duplicate reported download {dest.name} (checksum {checksum})")
+            try:
+                dest.unlink()
+            except OSError as exc:
+                logger.warning(f"Unable to remove duplicate {dest.name}: {exc}")
+            continue
+
+        if checksum:
+            checksum_index[checksum] = dest
+        saved += 1
+
+    return saved
+
+
+def _fetch_task_artifacts(task_id: str) -> List[Dict[str, Any]]:
+    """Retrieve artifact metadata for a task."""
+    try:
+        response = requests.get(
+            f"{SKYVERN_API_BASE}/tasks/{task_id}/artifacts",
+            headers={"x-api-key": SKYVERN_API_TOKEN}
+        )
+        if response.status_code == 200:
+            return response.json()
+        logger.warning(f"Failed to fetch artifacts for {task_id}: HTTP {response.status_code}")
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Artifact fetch failed for {task_id}: {exc}")
+
+    return []
+
+
+def _download_artifact_files(
+    task_id: str,
+    artifacts: List[Dict[str, Any]],
+    download_dir: Path,
+    checksum_index: Dict[str, Path]
+) -> int:
+    """Download artifact files for a task while deduplicating by checksum."""
+    saved = 0
+
+    for artifact in artifacts:
+        if artifact.get("artifact_type") != "download":
+            continue
+
+        artifact_id = artifact.get("artifact_id")
+        checksum = artifact.get("checksum")
+        filename = artifact.get("uri", f"download_{artifact_id}")
+
+        if checksum and checksum in checksum_index:
+            logger.info(f"Skipping duplicate artifact {filename} (checksum {checksum})")
+            continue
+
+        file_response = requests.get(
+            f"{SKYVERN_API_BASE}/artifacts/{artifact_id}/download",
+            stream=True,
+            headers={"x-api-key": SKYVERN_API_TOKEN}
+        )
+
+        if file_response.status_code != 200:
+            logger.warning(f"Failed to download artifact {artifact_id} for task {task_id}")
+            continue
+
+        dest = download_dir / Path(filename).name
+
+        with open(dest, 'wb') as handle:
+            for chunk in file_response.iter_content(chunk_size=8192):
+                handle.write(chunk)
+
+        if not is_evidence_file(dest.name):
+            logger.info(f"Skipping Skyvern artifact file: {dest.name}")
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            continue
+
+        checksum = checksum or _hash_file(dest)
+        if checksum and checksum in checksum_index:
+            logger.info(f"Removing duplicate artifact download {dest.name} (checksum {checksum})")
+            try:
+                dest.unlink()
+            except OSError as exc:
+                logger.warning(f"Unable to remove duplicate artifact {dest.name}: {exc}")
+            continue
+
+        if checksum:
+            checksum_index[checksum] = dest
+
+        file_size_mb = dest.stat().st_size / 1024 / 1024
+        logger.info(f"Downloaded artifact: {dest.name} ({file_size_mb:.2f} MB)")
+        saved += 1
+
+    return saved
+
+
+def _copy_from_task_mount(
+    task_id: str,
+    download_dir: Path,
+    checksum_index: Dict[str, Path]
+) -> int:
+    """Copy evidence files from the Skyvern host download directory into the case directory."""
+    task_directory = SKYVERN_DOWNLOAD_ROOT / task_id
+    if not task_directory.exists():
+        logger.debug(f"Skyvern download directory not found for task {task_id}: {task_directory}")
+        return 0
+
+    saved = 0
+    for file_path in task_directory.iterdir():
+        if not file_path.is_file() or not is_evidence_file(file_path.name):
+            continue
+
+        checksum = _hash_file(file_path)
+        if checksum and checksum in checksum_index:
+            logger.info(f"Skipping duplicate file from Skyvern volume: {file_path.name}")
+            continue
+
+        dest = download_dir / file_path.name
+        if file_path.resolve() == dest.resolve():
+            logger.debug(f"File already exists in destination: {dest}")
+        else:
+            try:
+                shutil.copy2(file_path, dest)
+            except OSError as exc:
+                logger.warning(f"Failed to copy {file_path.name} from Skyvern volume: {exc}")
+                continue
+
+        checksum = checksum or _hash_file(dest)
+        if checksum and checksum in checksum_index:
+            logger.info(f"Removing duplicate copied file {dest.name} (checksum {checksum})")
+            try:
+                dest.unlink()
+            except OSError as exc:
+                logger.warning(f"Unable to remove duplicate copied file {dest.name}: {exc}")
+            continue
+
+        if checksum:
+            checksum_index[checksum] = dest
+        saved += 1
+
+    return saved
+
+
+def _collect_downloads(
+    task_id: str,
+    download_path: str,
+    reported_downloads: Optional[List[Dict[str, Any]]]
+) -> bool:
+    """Aggregate downloads from all possible locations for a task."""
+    download_dir = Path(download_path)
+    checksum_index = _build_checksum_index(download_dir)
+
+    artifacts = _fetch_task_artifacts(task_id)
+    saved_from_report = _copy_reported_downloads(reported_downloads or [], download_dir, checksum_index)
+    saved_from_artifacts = _download_artifact_files(task_id, artifacts, download_dir, checksum_index)
+    saved_from_mount = _copy_from_task_mount(task_id, download_dir, checksum_index)
+
+    evidence_files = [f for f in download_dir.iterdir() if f.is_file() and is_evidence_file(f.name)]
+    total_new = saved_from_report + saved_from_artifacts + saved_from_mount
+
+    if evidence_files:
+        logger.info(
+            "Skyvern collected %d evidence file(s) (%d new) in %s",
+            len(evidence_files),
+            total_new,
+            download_dir
+        )
+        return True
+
+    logger.warning("Evidence files still not found after aggregating all sources")
+    return False
 
 
 def download_with_skyvern_api(
@@ -96,7 +357,8 @@ Steps:
    - Find the Download button or link (might say "Download", "Download All", "Download Files", "Export", etc.)
    - IMPORTANT: Click the download button to actually download the files
    - Wait for the browser's download to complete (check for download progress indicators)
-3. Make sure files are actually downloading - not just viewing or listing them
+3. Trigger each download only once. Do not repeatedly click the same button after it starts.
+4. As soon as downloads are running (progress/download indicator visible), stop interacting with the page and end the task so the files can finish downloading.
 """
         else:
             navigation_goal = """
@@ -106,7 +368,8 @@ Steps:
 1. Look for a "Files", "Documents", "Attachments", or "Evidence" section and navigate there if needed
 2. Find the download button or link (labeled "Download", "Download All", "Download Files", "Export", or similar)
 3. IMPORTANT: Click it to actually download the files (not just view them)
-4. Wait for the browser's download to complete (check for download progress indicators)
+4. Trigger each download only once unless it clearly fails.
+5. As soon as downloads begin, stop navigating and end the task so the browser can finish downloading everything in the background.
 """
 
         # Create navigation payload with increased max_steps for complex portals
@@ -114,13 +377,16 @@ Steps:
             "url": url,
             "navigation_goal": navigation_goal.strip(),
             "data_extraction_goal": None,
-            "navigation_payload": {},
+            "navigation_payload": {
+                "max_steps_per_run": SKYVERN_MAX_STEPS,
+                "terminate_after_download": True
+            },
             "extracted_information_schema": None,
             "webhook_callback_url": None,
             "totp_verification_url": None,
             "totp_identifier": None,
             "error_code_mapping": None,
-            "max_steps_per_run": 15  # Increased from default to handle complex portals
+            "max_steps_per_run": SKYVERN_MAX_STEPS
         }
 
         logger.info("Creating Skyvern task...")
@@ -148,7 +414,9 @@ Steps:
             return False
 
         logger.info(f"Skyvern task created: {task_id}")
-        # Rate limit protection: wait 15 seconds before polling\        logger.info(f"Waiting 15 seconds before polling to avoid rate limits...")\        time.sleep(15)\        logger.info(f"Resuming polling for task {task_id}")
+        logger.info("Waiting 15 seconds before polling to avoid rate limits...")
+        time.sleep(15)
+        logger.info(f"Resuming polling for task {task_id}")
 
         # Poll for task completion
         max_wait_time = 3600  # 1 hour
@@ -174,7 +442,7 @@ Steps:
 
             logger.info(f"Skyvern task status: {status} ({elapsed}s elapsed)")
 
-            if status in ["completed", "success", "terminated"]:
+            if status in FINAL_TASK_STATUSES:
                 logger.info(f"Skyvern task finished with status: {status}")
 
                 failure_reason = task_status.get("failure_reason")
@@ -184,107 +452,20 @@ Steps:
                     if any(keyword in reason_lower for keyword in ["login", "session", "credential"]):
                         logger.warning("Skyvern likely hit an authentication wall (session expired or login page)")
 
-                # Check for downloaded artifacts
-                # Skyvern stores artifacts in the configured artifact path
-                # We need to check if any files were downloaded
+                reported_downloads = task_status.get("downloaded_files") or []
+                if reported_downloads:
+                    logger.info(f"Task reported {len(reported_downloads)} downloaded file(s)")
 
-                # Get task artifacts
-                artifacts_response = requests.get(
-                    f"{SKYVERN_API_BASE}/tasks/{task_id}/artifacts",
-                    headers={"x-api-key": SKYVERN_API_TOKEN}
-                )
-
-                if artifacts_response.status_code == 200:
-                    artifacts = artifacts_response.json()
-                    logger.info(f"Task artifacts: {len(artifacts)} artifact(s)")
-
-                    # Download artifacts to our download_path
-                    downloaded_files = 0
-                    for artifact in artifacts:
-                        artifact_id = artifact.get("artifact_id")
-                        artifact_type = artifact.get("artifact_type")
-
-                        if artifact_type == "download":
-                            # This is a downloaded file - get it
-                            file_response = requests.get(
-                                f"{SKYVERN_API_BASE}/artifacts/{artifact_id}/download",
-                                stream=True,
-                                headers={"x-api-key": SKYVERN_API_TOKEN}
-                            )
-
-                            if file_response.status_code == 200:
-                                # Save the file
-                                filename = artifact.get("uri", f"download_{artifact_id}")
-                                filepath = Path(download_path) / Path(filename).name
-
-                                # Check if this is an evidence file
-                                if not is_evidence_file(filepath.name):
-                                    logger.info(f"Skipping Skyvern artifact: {filepath.name}")
-                                    continue
-
-                                with open(filepath, 'wb') as f:
-                                    for chunk in file_response.iter_content(chunk_size=8192):
-                                        f.write(chunk)
-
-                                file_size_mb = filepath.stat().st_size / 1024 / 1024
-                                logger.info(f"Downloaded: {filepath.name} ({file_size_mb:.2f} MB)")
-                                downloaded_files += 1
-
-                    if downloaded_files > 0:
-                        logger.info(f"Successfully downloaded {downloaded_files} evidence file(s) with Skyvern")
-                        return True
-
-                # Check if files exist in download directory (filter out screenshots)
-                # (Skyvern might save directly to configured download path)
-                all_files = list(Path(download_path).glob("*"))
-                evidence_files = [f for f in all_files if f.is_file() and is_evidence_file(f.name)]
-
-                if evidence_files:
-                    logger.info(f"Successfully downloaded {len(evidence_files)} evidence file(s) with Skyvern:")
-                    for f in evidence_files:
-                        size_mb = f.stat().st_size / 1024 / 1024
-                        logger.info(f"  - {f.name} ({size_mb:.2f} MB)")
-
-                    # Clean up Skyvern screenshots
-                    for f in all_files:
-                        if f.is_file() and not is_evidence_file(f.name):
-                            logger.info(f"Removing Skyvern artifact: {f.name}")
-                            f.unlink()
-
+                downloads_found = _collect_downloads(task_id, download_path, reported_downloads)
+                if downloads_found:
                     return True
 
-                # Check Skyvern's actual downloads directory (volume mounted)
-                skyvern_download_dir = Path("/root/skyvern/downloads") / task_id
-                if skyvern_download_dir.exists():
-                    all_files = list(skyvern_download_dir.glob("*"))
-                    evidence_files = [f for f in all_files if f.is_file() and is_evidence_file(f.name)]
+                if status in FAILURE_STATUSES:
+                    failure_reason = failure_reason or "Unknown"
+                    logger.error(f"Skyvern task failed without evidence files: {failure_reason}")
+                    return False
 
-                    if evidence_files:
-                        logger.info(f"Successfully downloaded {len(evidence_files)} evidence file(s) with Skyvern:")
-                        for f in evidence_files:
-                            size_mb = f.stat().st_size / 1024 / 1024
-                            logger.info(f"  - {f.name} ({size_mb:.2f} MB)")
-
-                        # Copy evidence files to the requested download_path
-                        Path(download_path).mkdir(parents=True, exist_ok=True)
-                        for f in evidence_files:
-                            dest = Path(download_path) / f.name
-                            logger.info(f"Copying {f.name} to {download_path}")
-                            import shutil
-                            shutil.copy2(f, dest)
-
-                        return True
-
-                logger.warning("Skyvern task completed but no evidence files found (only artifacts)")
-                failure_reason = task_status.get("failure_reason")
-                if failure_reason:
-                    logger.warning(f"Skyvern failure reason: {failure_reason}")
-                logger.warning("Skyvern may have navigated the portal but didn't actually download files")
-                return False
-
-            elif status in ["failed", "error"]:
-                failure_reason = task_status.get("failure_reason", "Unknown")
-                logger.error(f"Skyvern task failed: {failure_reason}")
+                logger.warning("Skyvern task completed but no evidence files were located")
                 return False
 
         logger.error(f"Skyvern task timed out after {max_wait_time} seconds")
