@@ -9,6 +9,7 @@ import re
 import gdown
 from llm_parser import SmartParser
 from skyvern_api_downloader import download_with_skyvern_api
+from llm_credential_parser import parse_credentials_with_llm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,22 +57,9 @@ class FileDownloader:
         username = None
         password = None
         if login_creds:
-            # Try smart LLM parser first
-            if self.smart_parser:
-                try:
-                    parsed = self.smart_parser.parse_credentials(login_creds)
-                    username = parsed.get('username')
-                    password = parsed.get('password')
-                    logger.info(f"Smart parser extracted credentials: username={username}")
-                except Exception as e:
-                    logger.warning(f"Smart parser failed: {e}, falling back to simple split")
-
-            # Fallback to simple split if parser didn't work
-            if not username and ':' in login_creds:
-                parts = login_creds.split(':', 1)
-                username = parts[0].strip()
-                password = parts[1].strip() if len(parts) > 1 else None
-                logger.info(f"Simple split extracted: username={username}")
+            # Use the built-in credential parser
+            username, password = self._parse_credentials(login_creds)
+            logger.info(f"Parsed credentials - Username: {username}, Has password: {bool(password)}")
 
         # Try Skyvern
         skyvern_success = download_with_skyvern_api(
@@ -796,43 +784,57 @@ class FileDownloader:
             return False
     def _parse_credentials(self, login_creds: str) -> tuple:
         """
-        Intelligently parse login credentials from various formats
+        Parse login credentials using LLM for maximum flexibility.
+        Handles ANY format automatically (slash-separated, newline-separated, colon-separated, etc.)
         """
-        # Try to find email/username and password patterns
-        email_patterns = [
-            r'(?:username|user|email|login)[:\s]+([^\s\n]+)',
-            r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
-        ]
+        if not login_creds or not login_creds.strip():
+            return ('', '')
 
-        password_patterns = [
-            r'(?:password|pass|pwd)[:\s]+([^\s\n]+)',
-        ]
+        # Try LLM-based parsing first
+        try:
+            result = parse_credentials_with_llm(login_creds)
+            username = result.get('username', '')
+            password = result.get('password', '')
 
+            if username or password:
+                logger.info(f'LLM parsed credentials - Username: {username}, Has password: {bool(password)}')
+                return (username, password)
+            else:
+                logger.warning('LLM parser returned empty credentials')
+        except Exception as e:
+            logger.warning(f'LLM credential parsing failed: {e}')
+
+        # Fallback to regex-based parsing if LLM fails
+        logger.info('Falling back to regex-based credential parsing')
         username = None
         password = None
 
-        for pattern in email_patterns:
-            match = re.search(pattern, login_creds, re.IGNORECASE)
-            if match:
-                username = match.group(1)
-                break
+        # Try newline-separated format (username\npassword)
+        if '\n' in login_creds:
+            lines = [line.strip() for line in login_creds.split('\n') if line.strip()]
+            if len(lines) >= 2:
+                username = lines[0]
+                password = lines[1]
 
-        for pattern in password_patterns:
-            match = re.search(pattern, login_creds, re.IGNORECASE)
-            if match:
-                password = match.group(1)
-                break
+        # Try slash-separated format (username / password)
+        elif ' / ' in login_creds:
+            parts = login_creds.split(' / ', 1)
+            if len(parts) >= 2:
+                username = parts[0].strip()
+                password = parts[1].strip()
 
-        if not username and ':' in login_creds and '\n' not in login_creds:
+        # Try colon-separated format (username:password)
+        elif ':' in login_creds:
             parts = login_creds.split(':', 1)
             username = parts[0].strip()
             password = parts[1].strip() if len(parts) > 1 else ''
 
-        if not username:
+        # Just username
+        else:
             username = login_creds.strip()
 
         logger.info(f'Parsed credentials - Username: {username}, Has password: {bool(password)}')
-        return username, password or ''
+        return (username, password or '')
 
     def _handle_login(self, page, login_creds: str) -> bool:
         """Handle login using credentials"""

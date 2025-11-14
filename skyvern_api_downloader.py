@@ -109,7 +109,7 @@ Steps:
 4. Wait for the browser's download to complete (check for download progress indicators)
 """
 
-        # Create navigation payload
+        # Create navigation payload with increased max_steps for complex portals
         payload = {
             "url": url,
             "navigation_goal": navigation_goal.strip(),
@@ -119,7 +119,8 @@ Steps:
             "webhook_callback_url": None,
             "totp_verification_url": None,
             "totp_identifier": None,
-            "error_code_mapping": None
+            "error_code_mapping": None,
+            "max_steps_per_run": 15  # Increased from default to handle complex portals
         }
 
         logger.info("Creating Skyvern task...")
@@ -147,9 +148,10 @@ Steps:
             return False
 
         logger.info(f"Skyvern task created: {task_id}")
+        # Rate limit protection: wait 15 seconds before polling\        logger.info(f"Waiting 15 seconds before polling to avoid rate limits...")\        time.sleep(15)\        logger.info(f"Resuming polling for task {task_id}")
 
         # Poll for task completion
-        max_wait_time = 300  # 5 minutes
+        max_wait_time = 3600  # 1 hour
         poll_interval = 5  # 5 seconds
         elapsed = 0
 
