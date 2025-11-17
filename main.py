@@ -13,6 +13,8 @@ Supports parallel execution for long-running downloads
 """
 
 import os
+import shutil
+import glob
 import sys
 import time
 import json
@@ -35,6 +37,7 @@ load_dotenv()
 NOTION_API_KEY = os.getenv('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
 DOWNLOAD_BASE_PATH = os.getenv('DOWNLOAD_BASE_PATH', '/mnt/HC_Volume_103781006/evidence_files')
+SKYVERN_DOWNLOADS_PATH = '/mnt/HC_Volume_103781006/skyvern/downloads'
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '60'))
 
 # Skyvern configuration
@@ -175,53 +178,53 @@ def download_with_local_skyvern(url, username, password, suspect_name, page_id):
 
         # Check final status
         if workflow_status == 'completed':
-            # Get downloaded files from artifacts
-            artifacts_response = requests.get(
-                f"{SKYVERN_API_BASE}/workflows/runs/{workflow_run_id}/artifacts",
-                headers=headers,
-                timeout=14400
-            )
-
-            if artifacts_response.status_code == 200:
-                artifacts = artifacts_response.json()
-                # Extract downloaded files
-                downloaded_files = [a for a in artifacts if a.get('artifact_type') == 'downloaded_file']
-
+            # Check local Skyvern downloads directory for files
+            skyvern_download_dir = os.path.join(SKYVERN_DOWNLOADS_PATH, workflow_run_id)
+            
+            if os.path.exists(skyvern_download_dir):
+                # Get all files from the directory
+                all_files = glob.glob(os.path.join(skyvern_download_dir, '*'))
+                downloaded_files = [f for f in all_files if os.path.isfile(f)]
+                
                 if downloaded_files:
-                    print(f"✅ SUCCESS! Downloaded {len(downloaded_files)} file(s)")
-
-                    # Download and upload to Dropbox
+                    print(f"✅ SUCCESS! Found {len(downloaded_files)} file(s) in {skyvern_download_dir}")
+                    
+                    # Create local directory for this suspect
+                    local_dir = os.path.join(DOWNLOAD_BASE_PATH, suspect_name)
+                    os.makedirs(local_dir, exist_ok=True)
+                    
+                    # Copy files from Skyvern downloads to final location
                     success_count = 0
-                    for artifact in downloaded_files:
-                        artifact_url = artifact.get('uri')
-                        filename = artifact.get('filename', 'download')
-
-                        # Download artifact
-                        artifact_response = requests.get(artifact_url, timeout=300)
-                        if artifact_response.status_code == 200:
-                            # Save locally
-                            local_dir = os.path.join(DOWNLOAD_BASE_PATH, suspect_name)
-                            os.makedirs(local_dir, exist_ok=True)
-                            local_path = os.path.join(local_dir, filename)
-
-                            with open(local_path, 'wb') as f:
-                                f.write(artifact_response.content)
-
+                    for file_path in downloaded_files:
+                        filename = os.path.basename(file_path)
+                        dest_path = os.path.join(local_dir, filename)
+                        
+                        try:
+                            # Copy file
+                            shutil.copy2(file_path, dest_path)
+                            print(f"   Copied: {filename} ({os.path.getsize(file_path) / (1024*1024):.1f} MB)")
+                            
                             # Upload to Dropbox
-                            if upload_to_dropbox(suspect_name, local_path):
+                            if upload_to_dropbox(suspect_name, dest_path):
                                 success_count += 1
-
+                        except Exception as e:
+                            print(f"   ❌ Failed to copy {filename}: {e}")
+                    
                     if success_count > 0:
                         notion.update_case_status(
                             page_id,
                             status="Downloaded",
                         )
+                        print(f"✅ Successfully processed {success_count}/{len(downloaded_files)} files")
                         return True, downloaded_files
+                    else:
+                        print(f"❌ Failed to process any files")
+                        return False, []
                 else:
-                    print(f"⚠️ Workflow completed but no files downloaded")
+                    print(f"⚠️ Workflow completed but directory is empty: {skyvern_download_dir}")
                     return False, []
             else:
-                print(f"⚠️ Could not retrieve artifacts: {artifacts_response.status_code}")
+                print(f"⚠️ Download directory not found: {skyvern_download_dir}")
                 return False, []
         else:
             print(f"❌ Workflow failed with status: {workflow_status}")
