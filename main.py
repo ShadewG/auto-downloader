@@ -420,20 +420,7 @@ def process_case(case):
         print(f"\n✅ Case processed successfully via Local Skyvern")
         return
 
-    # STAGE 2: Cloud Skyvern Fallback
-    success, workflow_run_id = download_with_cloud_skyvern(
-        url=download_link,
-        username=username,
-        password=password,
-        suspect_name=suspect_name,
-        page_id=page_id
-    )
-
-    if success:
-        print(f"\n✅ Case handed off to Cloud Skyvern (S3 monitor will process files)")
-        return
-
-    # STAGE 3: Playwright Fallback
+    # STAGE 2: Playwright Fallback
     success = download_with_playwright(
         url=download_link,
         username=username,
@@ -446,11 +433,11 @@ def process_case(case):
         print(f"\n✅ Case processed successfully via Playwright")
         return
 
-    # STAGE 4: All methods failed
+    # STAGE 3: All methods failed
     mark_as_failed(
         suspect_name=suspect_name,
         url=download_link,
-        reason="Local Skyvern, Cloud Skyvern, and Playwright all failed",
+        reason="Local Skyvern and Playwright all failed",
         page_id=page_id
     )
 
@@ -466,9 +453,8 @@ def main():
     print(f"Architecture:")
     print(f"  Stage 0: LLM Pre-filter")
     print(f"  Stage 1: Local Skyvern (V2 workflow, 4hr timeout)")
-    print(f"  Stage 2: Cloud Skyvern → S3 → s3_monitor.py")
-    print(f"  Stage 3: Playwright fallback")
-    print(f"  Stage 4: Mark as Failed")
+    print(f"  Stage 2: Playwright fallback")
+    print(f"  Stage 3: Mark as Failed")
     print(f"")
     print(f"Poll Interval: {POLL_INTERVAL} seconds")
     print(f"{'#'*80}\n")
