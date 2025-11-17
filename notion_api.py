@@ -12,7 +12,7 @@ class NotionCaseClient:
         self.client = Client(auth=api_key)
         self.database_id = database_id
     
-    def get_cases_ready_for_download(self, limit: int = 4) -> List[Dict]:
+    def get_cases_ready_for_download(self, limit: int = 1) -> List[Dict]:
         """
         Query Notion database for cases with 'Download Status' not empty 
         and equals 'Ready for Download'

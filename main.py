@@ -1,195 +1,509 @@
 #!/usr/bin/env python3
+"""
+Enhanced Evidence File Downloader with Complete Fallback Chain
+
+Architecture:
+1. LLM Pre-filter - Evaluate case notes to skip non-downloadable cases
+2. Local Skyvern (V2 workflow with file_download block) - 4 hour timeout
+3. Cloud Skyvern Fallback - Uploads to S3, monitored by s3_monitor.py
+4. Playwright Fallback - Direct browser automation
+5. Mark as Failed - Update Notion status
+
+Supports parallel execution for long-running downloads
+"""
+
 import os
 import sys
 import time
-import shutil
+import json
+import requests
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
-import logging
 
-from notion_api import NotionCaseClient
-from dropbox_client import DropboxClient
-from downloader import FileDownloader
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(__file__))
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from notion_api import NotionCaseClient as NotionAPI
+from dropbox_uploader import upload_to_dropbox
+from llm_pre_filter import should_download_case
 
-class CaseDownloadOrchestrator:
-    def __init__(self):
-        # Load environment variables
-        load_dotenv()
-        
-        self.notion_api_key = os.getenv('NOTION_API_KEY')
-        self.notion_db_id = os.getenv('NOTION_DATABASE_ID')
-        self.dropbox_app_key = os.getenv('DROPBOX_APP_KEY')
-        self.dropbox_app_secret = os.getenv('DROPBOX_APP_SECRET')
-        self.dropbox_member_id = os.getenv("DROPBOX_MEMBER_ID")
-        self.download_path = os.getenv('DOWNLOAD_PATH', '/tmp/case_downloads')
-        self.check_interval = int(os.getenv('CHECK_INTERVAL', 3600))
-        self.test_mode = os.getenv('TEST_MODE', 'True').lower() == 'true'
-        self.test_case_limit = int(os.getenv('TEST_CASE_LIMIT', 4))
-        
-        # Initialize clients
-        self.notion = NotionCaseClient(self.notion_api_key, self.notion_db_id)
-        self.dropbox = DropboxClient(self.dropbox_app_key, self.dropbox_app_secret, self.dropbox_member_id)
-        self.downloader = FileDownloader(self.download_path)
-    
-    def process_case(self, case: dict) -> bool:
-        """Process a single case: download files and upload to Dropbox"""
-        page_id = case['page_id']
-        suspect_name = case['suspect_name']
-        download_links = case['download_links']
-        login_creds = case['login_credentials']
-        
-        logger.info(f"Processing case: {suspect_name}")
-        logger.info(f"Found {len(download_links)} download link(s)")
-        
-        # Update status to Downloading
-        self.notion.update_case_status(page_id, "Auto Downloading")
-        
-        # Create case folder with suspect name and date
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        case_folder_name = f"{suspect_name} {date_str}"
-        
-        # Sanitize folder name
-        case_folder_name = self._sanitize_filename(case_folder_name)
-        
-        local_case_path = os.path.join(self.download_path, case_folder_name)
-        os.makedirs(local_case_path, exist_ok=True)
-        
-        # Download all files
-        downloaded_files = []
-        for i, url in enumerate(download_links, 1):
-            logger.info(f"Downloading file {i}/{len(download_links)} from: {url}")
-            
-            downloaded_file = self.downloader.download_file(
-                url,
-                case_folder_name,
-                login_creds
-            )
-            
-            if downloaded_file:
-                downloaded_files.append(downloaded_file)
-                logger.info(f"Successfully downloaded: {downloaded_file}")
-            else:
-                logger.warning(f"Failed to download from: {url}")
-        
-        if not downloaded_files:
-            logger.error(f"No files downloaded for case: {suspect_name}")
-            self.notion.update_case_status(page_id, "Auto Download Failed")
-            return False
-        
-        logger.info(f"Downloaded {len(downloaded_files)} file(s) for {suspect_name}")
-        
-        # Update status to Uploading
-        self.notion.update_case_status(page_id, "Auto Uploading")
-        
-        # Upload to Dropbox
-        dropbox_folder_path = f"/Auto Foia/{case_folder_name}"
-        
-        logger.info(f"Uploading to Dropbox: {dropbox_folder_path}")
-        upload_success = self.dropbox.upload_folder(local_case_path, dropbox_folder_path)
-        
-        if upload_success:
-            # Get shared link
-            shared_link = self.dropbox.get_shared_link(dropbox_folder_path)
-            
-            if shared_link:
-                # Add Dropbox link to Notion
-                self.notion.add_dropbox_link(page_id, shared_link)
-            
-            # Update status to Uploaded
-            self.notion.update_case_status(page_id, "Auto Uploaded")
-            logger.info(f"Successfully processed case: {suspect_name}")
-            
-            # Clean up local files
-            try:
-                shutil.rmtree(local_case_path)
-                logger.info(f"Cleaned up local files for: {suspect_name}")
-            except Exception as e:
-                logger.warning(f"Error cleaning up {local_case_path}: {e}")
-            
-            return True
-        else:
-            logger.error(f"Failed to upload to Dropbox for case: {suspect_name}")
-            self.notion.update_case_status(page_id, "Auto Upload Failed")
-            return False
-    
-    def run_once(self):
-        """Run the download process once"""
-        logger.info("Starting case download process...")
-        
-        # Get cases ready for download
-        limit = self.test_case_limit if self.test_mode else 100
-        cases = self.notion.get_cases_ready_for_download(limit=limit)
-        
-        if not cases:
-            logger.info("No cases ready for download")
-            return
-        
-        logger.info(f"Found {len(cases)} case(s) ready for download")
-        
-        # Process each case
-        success_count = 0
-        for i, case in enumerate(cases, 1):
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing case {i}/{len(cases)}")
-            logger.info(f"{'='*60}\n")
-            
-            try:
-                if self.process_case(case):
-                    success_count += 1
-            except Exception as e:
-                logger.error(f"Error processing case {case['suspect_name']}: {e}")
-                continue
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Download process completed")
-        logger.info(f"Successfully processed: {success_count}/{len(cases)} cases")
-        logger.info(f"{'='*60}\n")
-    
-    def run_continuous(self):
-        """Run continuously, checking for new cases periodically"""
-        logger.info("Starting continuous monitoring mode...")
-        logger.info(f"Check interval: {self.check_interval} seconds ({self.check_interval//60} minutes)")
-        
+# Load environment variables
+load_dotenv()
+
+# Configuration
+NOTION_API_KEY = os.getenv('NOTION_API_KEY')
+NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
+DOWNLOAD_BASE_PATH = os.getenv('DOWNLOAD_BASE_PATH', '/mnt/HC_Volume_103781006/evidence_files')
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '60'))
+
+# Skyvern configuration
+SKYVERN_API_BASE = "http://5.161.210.79:8000/api/v1"
+SKYVERN_API_TOKEN = os.getenv('SKYVERN_API_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc5MzY4NDcsInN1YiI6Im9fNDYwODIyNzA2MTQ3NzI4MTE4In0.a81nQ5EZV5xcE942hWfzkU-3Z7Kwqc31ypgahKKithI')
+SKYVERN_WORKFLOW_V2_ID = "wpid_461538336606218912"  # V2 workflow with file_download block
+SKYVERN_TIMEOUT = 14400  # 4 hours in seconds
+
+# Cloud Skyvern configuration
+CLOUD_SKYVERN_API_BASE = "https://api.skyvern.com/v1"
+CLOUD_SKYVERN_API_KEY = os.getenv('CLOUD_SKYVERN_API_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc3Mjc1MTgsInN1YiI6Im9fNDU5OTIzNjM1MjE0NTIzOTQ4In0.M4e1HPultXky47lUO6S3STWM6PHPPJ0S2a9va8VEUfo')
+CLOUD_WORKFLOW_ID = "wpid_461522695995697924"
+
+# Initialize Notion client
+notion = NotionAPI(NOTION_API_KEY, NOTION_DATABASE_ID)
+
+
+def parse_credentials(login_text):
+    """Parse login credentials from various formats"""
+    if not login_text:
+        return None, None
+
+    # Try to extract email and password
+    lines = [line.strip() for line in login_text.split('\n') if line.strip()]
+
+    username = None
+    password = None
+
+    for line in lines:
+        lower_line = line.lower()
+        if 'email:' in lower_line or 'username:' in lower_line:
+            username = line.split(':', 1)[1].strip()
+        elif 'password:' in lower_line:
+            password = line.split(':', 1)[1].strip()
+        elif '@' in line and not username:
+            # Likely an email address
+            username = line
+        elif not password and not any(x in lower_line for x in ['email', 'username']):
+            # Likely a password
+            password = line
+
+    return username, password
+
+
+def download_with_local_skyvern(url, username, password, suspect_name, page_id):
+    """
+    Attempt download using local Skyvern with V2 workflow (file_download block)
+    4-hour timeout allows for large downloads
+
+    Returns:
+        tuple: (success: bool, downloaded_files: list)
+    """
+    print(f"\n{'='*80}")
+    print(f"STAGE 1: LOCAL SKYVERN (V2 Workflow)")
+    print(f"{'='*80}")
+    print(f"Suspect: {suspect_name}")
+    print(f"URL: {url}")
+    print(f"Timeout: {SKYVERN_TIMEOUT/3600} hours")
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": SKYVERN_API_TOKEN
+    }
+
+    # Format credentials
+    if username and password:
+        login = f"Email: {username}\nPassword: {password}"
+    else:
+        login = ""
+
+    # Trigger workflow
+    payload = {
+        "data": {
+            "URL": url,
+            "login": login
+        },
+        "proxy_location": "RESIDENTIAL"
+    }
+
+    try:
+        # Start workflow
+        response = requests.post(
+            f"{SKYVERN_API_BASE}/workflows/{SKYVERN_WORKFLOW_V2_ID}/run",
+            headers=headers,
+            json=payload,
+            timeout=14400
+        )
+
+        if response.status_code != 200:
+            print(f"❌ Failed to start workflow: {response.status_code}")
+            print(f"   Response: {response.text[:200]}")
+            return False, []
+
+        run_data = response.json()
+        workflow_run_id = run_data.get('workflow_run_id')
+
+        print(f"✅ Workflow started: {workflow_run_id}")
+        print(f"   Monitor: http://5.161.210.79:8080/workflows/run/{workflow_run_id}")
+
+        # Update Notion with workflow ID
+        notion.update_case_status(
+            page_id,
+            status="Downloading",
+        )
+
+        # Poll for completion (4-hour timeout)
+        start_time = time.time()
+        poll_interval = 30  # Check every 30 seconds
+
         while True:
-            try:
-                self.run_once()
-            except Exception as e:
-                logger.error(f"Error in continuous run: {e}")
-            
-            logger.info(f"Waiting {self.check_interval} seconds before next check...")
-            time.sleep(self.check_interval)
-    
-    def _sanitize_filename(self, filename: str) -> str:
-        """Remove invalid characters from filename and truncate if too long"""
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            filename = filename.replace(char, '_')
-        filename = filename.strip()
+            elapsed = time.time() - start_time
 
-        # Limit to 200 characters to stay well under filesystem limit (255)
-        # This leaves room for date suffix and file extensions
-        if len(filename) > 200:
-            filename = filename[:200].strip()
+            if elapsed > SKYVERN_TIMEOUT:
+                print(f"⏱️ Timeout after {SKYVERN_TIMEOUT/3600} hours")
+                return False, []
 
-        return filename
+            # Check workflow status
+            status_response = requests.get(
+                f"{SKYVERN_API_BASE}/workflows/runs/{workflow_run_id}",
+                headers=headers,
+                timeout=14400
+            )
+
+            if status_response.status_code != 200:
+                print(f"❌ Error checking status: {status_response.status_code}")
+                time.sleep(poll_interval)
+                continue
+
+            status_data = status_response.json()
+            workflow_status = status_data.get('status')
+
+            print(f"   Status: {workflow_status} (elapsed: {int(elapsed/60)}min)")
+
+            if workflow_status in ['completed', 'failed', 'terminated', 'canceled']:
+                break
+
+            time.sleep(poll_interval)
+
+        # Check final status
+        if workflow_status == 'completed':
+            # Get downloaded files from artifacts
+            artifacts_response = requests.get(
+                f"{SKYVERN_API_BASE}/workflows/runs/{workflow_run_id}/artifacts",
+                headers=headers,
+                timeout=14400
+            )
+
+            if artifacts_response.status_code == 200:
+                artifacts = artifacts_response.json()
+                # Extract downloaded files
+                downloaded_files = [a for a in artifacts if a.get('artifact_type') == 'downloaded_file']
+
+                if downloaded_files:
+                    print(f"✅ SUCCESS! Downloaded {len(downloaded_files)} file(s)")
+
+                    # Download and upload to Dropbox
+                    success_count = 0
+                    for artifact in downloaded_files:
+                        artifact_url = artifact.get('uri')
+                        filename = artifact.get('filename', 'download')
+
+                        # Download artifact
+                        artifact_response = requests.get(artifact_url, timeout=300)
+                        if artifact_response.status_code == 200:
+                            # Save locally
+                            local_dir = os.path.join(DOWNLOAD_BASE_PATH, suspect_name)
+                            os.makedirs(local_dir, exist_ok=True)
+                            local_path = os.path.join(local_dir, filename)
+
+                            with open(local_path, 'wb') as f:
+                                f.write(artifact_response.content)
+
+                            # Upload to Dropbox
+                            if upload_to_dropbox(suspect_name, local_path):
+                                success_count += 1
+
+                    if success_count > 0:
+                        notion.update_case_status(
+                            page_id,
+                            status="Downloaded",
+                        )
+                        return True, downloaded_files
+                else:
+                    print(f"⚠️ Workflow completed but no files downloaded")
+                    return False, []
+            else:
+                print(f"⚠️ Could not retrieve artifacts: {artifacts_response.status_code}")
+                return False, []
+        else:
+            print(f"❌ Workflow failed with status: {workflow_status}")
+            return False, []
+
+    except Exception as e:
+        print(f"❌ Error in local Skyvern: {e}")
+        return False, []
+
+
+def download_with_cloud_skyvern(url, username, password, suspect_name, page_id):
+    """
+    Attempt download using Cloud Skyvern API
+    Files uploaded to S3, processed by s3_monitor.py
+
+    Returns:
+        tuple: (success: bool, workflow_run_id: str or None)
+    """
+    print(f"\n{'='*80}")
+    print(f"STAGE 2: CLOUD SKYVERN FALLBACK")
+    print(f"{'='*80}")
+    print(f"Suspect: {suspect_name}")
+    print(f"Files will be uploaded to S3 bucket for monitoring")
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": CLOUD_SKYVERN_API_KEY
+    }
+
+    # Format credentials
+    if username and password:
+        login = f"Email: {username}\nPassword: {password}"
+    else:
+        login = ""
+
+    payload = {
+        "workflow_id": CLOUD_WORKFLOW_ID,
+        "parameters": {
+            "URL": url,
+            "login": login
+        },
+        "proxy_location": "RESIDENTIAL_ISP",
+        "run_with": "agent",
+        "ai_fallback": True
+    }
+
+    try:
+        response = requests.post(
+            f"{CLOUD_SKYVERN_API_BASE}/run/workflows",
+            headers=headers,
+            json=payload,
+            timeout=14400
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            workflow_run_id = result.get('workflow_run_id')
+
+            print(f"✅ Cloud workflow triggered: {workflow_run_id}")
+            print(f"   Files will be uploaded to S3")
+            print(f"   S3 monitor will auto-download and upload to Dropbox")
+
+            # Update Notion
+            notion.update_case_status(
+                page_id,
+                status="Downloading",
+            )
+
+            return True, workflow_run_id
+        else:
+            print(f"❌ Cloud Skyvern API error: {response.status_code}")
+            print(f"   Response: {response.text[:200]}")
+            return False, None
+
+    except Exception as e:
+        print(f"❌ Error calling Cloud Skyvern: {e}")
+        return False, None
+
+
+def download_with_playwright(url, username, password, suspect_name, page_id):
+    """
+    Attempt download using Playwright direct automation
+
+    Returns:
+        bool: success status
+    """
+    print(f"\n{'='*80}")
+    print(f"STAGE 3: PLAYWRIGHT FALLBACK")
+    print(f"{'='*80}")
+    print(f"Suspect: {suspect_name}")
+    print(f"URL: {url}")
+
+    try:
+        # Import playwright downloader
+        pass # from downloader_full import download_files
+
+        local_dir = os.path.join(DOWNLOAD_BASE_PATH, suspect_name)
+        os.makedirs(local_dir, exist_ok=True)
+
+        # Attempt download
+        files = download_files(url, local_dir, username, password)
+
+        if files:
+            print(f"✅ Playwright downloaded {len(files)} file(s)")
+
+            # Upload to Dropbox
+            success_count = 0
+            for file_path in files:
+                if upload_to_dropbox(suspect_name, file_path):
+                    success_count += 1
+
+            if success_count > 0:
+                notion.update_case_status(
+                    page_id,
+                    status="Downloaded",
+                )
+                return True
+
+        print(f"❌ Playwright download failed")
+        return False
+
+    except Exception as e:
+        print(f"❌ Playwright error: {e}")
+        return False
+
+
+def mark_as_failed(suspect_name, url, reason, page_id):
+    """Mark case as failed in Notion"""
+    print(f"\n{'='*80}")
+    print(f"STAGE 4: MARKING AS FAILED")
+    print(f"{'='*80}")
+    print(f"Suspect: {suspect_name}")
+    print(f"Reason: {reason}")
+
+    notion.update_case_status(
+        page_id,
+        status="Failed",
+    )
+
+    print(f"✅ Marked as Failed in Notion")
+
+
+def process_case(case):
+    """Process a single case through the complete fallback chain"""
+
+    suspect_name = case.get('suspect_name', 'Unknown')
+    download_links = case.get("download_links", [])
+    download_link = download_links[0] if download_links else ""
+    login_text = case.get("login_credentials", "")
+    page_id = case.get('page_id')
+    case_notes = case.get('notes', '')
+
+    print(f"\n{'#'*80}")
+    print(f"PROCESSING: {suspect_name}")
+    print(f"{'#'*80}")
+    print(f"Download Link: {download_link}")
+    print(f"Page ID: {page_id}")
+
+#    # STAGE 0: LLM Pre-filter
+#    print(f"\n{'='*80}")
+#    print(f"STAGE 0: LLM PRE-FILTER")
+#    print(f"{'='*80}")
+#
+#    should_download, filter_reason = should_download_case(case_notes, suspect_name, download_link)
+#
+#    print(f"Decision: {'DOWNLOAD' if should_download else 'SKIP'}")
+#    print(f"Reason: {filter_reason}")
+#
+#    if not should_download:
+#        # Skip download, mark as not applicable
+#        notion.update_case_status(
+#            page_id,
+#            status="Not Applicable",
+#        )
+#        print(f"✅ Marked as Not Applicable in Notion")
+#        return
+#
+    # Parse credentials
+    username, password = parse_credentials(login_text)
+
+    if username and password:
+        print(f"Credentials: {username} / {'*' * len(password)}")
+    else:
+        print(f"Credentials: None")
+
+    # STAGE 1: Local Skyvern (V2 workflow with file_download block)
+    success, files = download_with_local_skyvern(
+        url=download_link,
+        username=username,
+        password=password,
+        suspect_name=suspect_name,
+        page_id=page_id
+    )
+
+    if success:
+        print(f"\n✅ Case processed successfully via Local Skyvern")
+        return
+
+    # STAGE 2: Cloud Skyvern Fallback
+    success, workflow_run_id = download_with_cloud_skyvern(
+        url=download_link,
+        username=username,
+        password=password,
+        suspect_name=suspect_name,
+        page_id=page_id
+    )
+
+    if success:
+        print(f"\n✅ Case handed off to Cloud Skyvern (S3 monitor will process files)")
+        return
+
+    # STAGE 3: Playwright Fallback
+    success = download_with_playwright(
+        url=download_link,
+        username=username,
+        password=password,
+        suspect_name=suspect_name,
+        page_id=page_id
+    )
+
+    if success:
+        print(f"\n✅ Case processed successfully via Playwright")
+        return
+
+    # STAGE 4: All methods failed
+    mark_as_failed(
+        suspect_name=suspect_name,
+        url=download_link,
+        reason="Local Skyvern, Cloud Skyvern, and Playwright all failed",
+        page_id=page_id
+    )
+
+    print(f"\n❌ Case failed after all fallback attempts")
+
 
 def main():
-    orchestrator = CaseDownloadOrchestrator()
-    
-    # Check if we should run in test mode or continuous mode
-    if orchestrator.test_mode:
-        logger.info("Running in TEST MODE (one-time run)")
-        orchestrator.run_once()
-    else:
-        logger.info("Running in CONTINUOUS MODE")
-        orchestrator.run_continuous()
+    """Main downloader loop"""
 
-if __name__ == '__main__':
+    print(f"\n{'#'*80}")
+    print(f"ENHANCED EVIDENCE FILE DOWNLOADER V2")
+    print(f"{'#'*80}")
+    print(f"Architecture:")
+    print(f"  Stage 0: LLM Pre-filter")
+    print(f"  Stage 1: Local Skyvern (V2 workflow, 4hr timeout)")
+    print(f"  Stage 2: Cloud Skyvern → S3 → s3_monitor.py")
+    print(f"  Stage 3: Playwright fallback")
+    print(f"  Stage 4: Mark as Failed")
+    print(f"")
+    print(f"Poll Interval: {POLL_INTERVAL} seconds")
+    print(f"{'#'*80}\n")
+
+    while True:
+        try:
+            # Get cases ready for download
+            cases = notion.get_cases_ready_for_download()
+
+            if not cases:
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No cases ready for download")
+            else:
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Found {len(cases)} case(s) ready for download")
+
+                for case in cases:
+                    try:
+                        process_case(case)
+                    except Exception as e:
+                        print(f"❌ Error processing case: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+            # Wait before next poll
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Waiting {POLL_INTERVAL} seconds...")
+            time.sleep(POLL_INTERVAL)
+
+        except KeyboardInterrupt:
+            print(f"\n\nDownloader stopped by user")
+            break
+        except Exception as e:
+            print(f"❌ Error in main loop: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
     main()

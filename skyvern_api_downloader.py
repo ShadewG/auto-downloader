@@ -151,6 +151,7 @@ def _create_browser_session(domain: str) -> Optional[str]:
         response = requests.post(
             f"{SKYVERN_API_BASE}/browser_sessions",
             json=payload,
+            timeout=14400,
             headers={
                 "Content-Type": "application/json",
                 "x-api-key": SKYVERN_API_TOKEN
@@ -313,6 +314,7 @@ def _fetch_task_artifacts(task_id: str) -> List[Dict[str, Any]]:
     try:
         response = requests.get(
             f"{SKYVERN_API_BASE}/tasks/{task_id}/artifacts",
+            timeout=14400,
             headers={"x-api-key": SKYVERN_API_TOKEN}
         )
         if response.status_code == 200:
@@ -350,6 +352,7 @@ def _download_artifact_files(
         file_response = requests.get(
             f"{SKYVERN_API_BASE}/artifacts/{artifact_id}/download",
             stream=True,
+            timeout=14400,
             headers={"x-api-key": SKYVERN_API_TOKEN}
         )
         if file_response.status_code != 200:
@@ -488,6 +491,7 @@ def _wait_for_task_completion(
         try:
             status_response = requests.get(
                 f"{SKYVERN_API_BASE}/tasks/{task_id}",
+                timeout=14400,
                 headers={"x-api-key": SKYVERN_API_TOKEN}
             )
 
@@ -627,6 +631,7 @@ Steps:
         response = requests.post(
             f"{SKYVERN_API_BASE}/tasks",
             json=payload,
+            timeout=14400,
             headers={
                 "Content-Type": "application/json",
                 "x-api-key": SKYVERN_API_TOKEN

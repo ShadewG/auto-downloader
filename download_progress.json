@@ -1,0 +1,16 @@
+{
+  "tsk_461502143087759172": {
+    "task_id": "tsk_461502143087759172",
+    "suspect_name": "Test Progress Monitor",
+    "url": "https://matchermedia.sharefile.com/d/a2af57c1b3054ce9",
+    "status": "completed",
+    "started_at": "2025-11-14T15:44:01.809730",
+    "updated_at": "2025-11-14T15:51:29.285387",
+    "steps_completed": 0,
+    "max_steps": 20,
+    "failure_reason": null,
+    "files_downloaded": 1,
+    "current_action": "Successfully downloaded files",
+    "screenshot_urls": []
+  }
+}
