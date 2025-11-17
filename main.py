@@ -52,7 +52,7 @@ CASE_LAUNCH_INTERVAL_SECONDS = int(os.getenv('CASE_LAUNCH_INTERVAL_SECONDS', str
 # Skyvern configuration
 SKYVERN_API_BASE = "http://5.161.210.79:8000/api/v1"
 SKYVERN_API_TOKEN = os.getenv('SKYVERN_API_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDc5MzY4NDcsInN1YiI6Im9fNDYwODIyNzA2MTQ3NzI4MTE4In0.a81nQ5EZV5xcE942hWfzkU-3Z7Kwqc31ypgahKKithI')
-SKYVERN_WORKFLOW_V2_ID = "wpid_462565196859569822"  # V2 workflow with file_download block
+SKYVERN_WORKFLOW_V2_ID = "wpid_462565939888912052"  # V2 workflow with file_download block
 SKYVERN_TIMEOUT = 14400  # 4 hours in seconds
 
 # Cloud Skyvern configuration (kept for manual triggers; automated fallback disabled)
