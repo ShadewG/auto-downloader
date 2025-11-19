@@ -1,11 +1,19 @@
 import os
 from notion_client import Client
-from datetime import datetime
 from typing import List, Dict, Optional
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+NOTION_LOCK_PROPERTY = os.getenv("NOTION_LOCK_PROPERTY", "Downloader Lock")
+NOTION_WORKFLOW_ID_PROPERTY = os.getenv("NOTION_WORKFLOW_ID_PROPERTY", "Workflow Run ID")
+CASE_NOTES_FIELDS = [
+    field.strip() for field in os.getenv(
+        "NOTION_CASE_NOTES_FIELDS",
+        "Case Notes,Notes"
+    ).split(",") if field.strip()
+]
 
 class NotionCaseClient:
     def __init__(self, api_key: str, database_id: str):
@@ -73,12 +81,30 @@ class NotionCaseClient:
                 logger.warning(f"No download links found for case: {suspect_name}")
                 return None
             
+            # Extract notes from configurable fields
+            case_notes = ""
+            for field in CASE_NOTES_FIELDS:
+                case_notes = self._get_text_property(properties, field)
+                if case_notes:
+                    break
+
+            workflow_run_id = None
+            if NOTION_WORKFLOW_ID_PROPERTY:
+                workflow_run_id = self._get_text_property(properties, NOTION_WORKFLOW_ID_PROPERTY)
+
+            lock_owner = None
+            if NOTION_LOCK_PROPERTY:
+                lock_owner = self._get_text_property(properties, NOTION_LOCK_PROPERTY)
+
             return {
                 'page_id': page_id,
                 'suspect_name': suspect_name or 'Unknown',
                 'download_links': download_links,
                 'login_credentials': login_credentials,
-                'title': self._get_title(page)
+                'title': self._get_title(page),
+                'notes': case_notes or '',
+                'workflow_run_id': workflow_run_id,
+                'lock_owner': lock_owner
             }
         
         except Exception as e:
@@ -150,15 +176,118 @@ class NotionCaseClient:
         if prop.get('type') == 'rich_text':
             rich_text = prop.get('rich_text', [])
             if rich_text and len(rich_text) > 0:
-                return rich_text[0].get('plain_text', '')
+                return ''.join([rt.get('plain_text', '') for rt in rich_text])
         return None
     
-    def update_case_status(self, page_id: str, status: str) -> bool:
-        """Update the Download Status of a case"""
+    def _rich_text_payload(self, value: Optional[str]) -> Dict:
+        """Build Notion rich_text payload for updates"""
+        if value:
+            return {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": value[:2000]}
+                    }
+                ]
+            }
+        return {"rich_text": []}
+
+    def _update_properties(self, page_id: str, properties: Dict) -> bool:
+        """Helper to update arbitrary properties while handling errors"""
         try:
             self.client.pages.update(
                 page_id=page_id,
-                properties={
+                properties=properties
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating properties {list(properties.keys())}: {e}")
+            return False
+
+    def update_case_status(self, page_id: str, status: str) -> bool:
+        """Update the Download Status of a case"""
+        success = self._update_properties(
+            page_id,
+            {
+                "Download Status": {
+                    "select": {
+                        "name": status
+                    }
+                }
+            }
+        )
+        if success:
+            logger.info(f"Updated case status to: {status}")
+        return success
+
+    def claim_case_for_download(self, page_id: str, worker_id: str) -> bool:
+        """Mark a case as Downloading and attach lock owner in a single update"""
+        properties: Dict = {
+            "Download Status": {
+                "select": {
+                    "name": "Downloading"
+                }
+            }
+        }
+        if NOTION_LOCK_PROPERTY:
+            properties[NOTION_LOCK_PROPERTY] = self._rich_text_payload(worker_id)
+        success = self._update_properties(page_id, properties)
+        if not success and NOTION_LOCK_PROPERTY:
+            # Retry without lock field so status can still advance
+            logger.warning("Lock property update failed; retrying without lock field.")
+            fallback_properties = {
+                "Download Status": properties["Download Status"]
+            }
+            success = self._update_properties(page_id, fallback_properties)
+        if success:
+            logger.info(f"Case {page_id} claimed by {worker_id}")
+        return success
+
+    def release_case_lock(self, page_id: str) -> bool:
+        """Clear the worker lock field so other workers can claim the case"""
+        if not NOTION_LOCK_PROPERTY:
+            return True
+        success = self._update_properties(
+            page_id,
+            {
+                NOTION_LOCK_PROPERTY: self._rich_text_payload(None)
+            }
+        )
+        if not success:
+            logger.warning("Failed to clear lock property; continuing")
+        return True
+
+    def update_workflow_run_id(self, page_id: str, workflow_run_id: Optional[str]) -> bool:
+        """Store or clear the workflow run id associated with this case"""
+        if not NOTION_WORKFLOW_ID_PROPERTY:
+            return True
+        success = self._update_properties(
+            page_id,
+            {
+                NOTION_WORKFLOW_ID_PROPERTY: self._rich_text_payload(workflow_run_id)
+            }
+        )
+        if not success:
+            logger.warning("Failed to update workflow run id; continuing")
+        return success
+
+    def update_case_status_and_workflow(self, page_id: str, status: str, workflow_run_id: Optional[str]) -> bool:
+        """Convenience helper to update status and workflow metadata together"""
+        properties = {
+            "Download Status": {
+                "select": {
+                    "name": status
+                }
+            }
+        }
+        if NOTION_WORKFLOW_ID_PROPERTY:
+            properties[NOTION_WORKFLOW_ID_PROPERTY] = self._rich_text_payload(workflow_run_id)
+        success = self._update_properties(page_id, properties)
+        if not success and NOTION_WORKFLOW_ID_PROPERTY:
+            logger.warning("Workflow run id update failed; retrying with status only.")
+            success = self._update_properties(
+                page_id,
+                {
                     "Download Status": {
                         "select": {
                             "name": status
@@ -166,11 +295,33 @@ class NotionCaseClient:
                     }
                 }
             )
-            logger.info(f"Updated case status to: {status}")
-            return True
+        return success
+
+    def count_cases_with_status(self, status: str) -> int:
+        """Count the number of cases currently set to a given Download Status"""
+        try:
+            start_cursor = None
+            total = 0
+            while True:
+                response = self.client.databases.query(
+                    database_id=self.database_id,
+                    filter={
+                        "property": "Download Status",
+                        "select": {
+                            "equals": status
+                        }
+                    },
+                    start_cursor=start_cursor
+                )
+                total += len(response.get("results", []))
+                if response.get("has_more"):
+                    start_cursor = response.get("next_cursor")
+                else:
+                    break
+            return total
         except Exception as e:
-            logger.error(f"Error updating case status: {e}")
-            return False
+            logger.error(f"Error counting cases with status {status}: {e}")
+            return 0
     
     def add_dropbox_link(self, page_id: str, dropbox_link: str) -> bool:
         """Add Dropbox link to the case"""
@@ -219,3 +370,14 @@ class NotionCaseClient:
         except Exception as e:
             logger.error(f"Error resetting stuck cases: {e}")
             return 0
+    def update_failure_reason(self, page_id: str, reason: str) -> bool:
+        """Update the Failure Reason property when a download fails"""
+        success = self._update_properties(
+            page_id,
+            {
+                "Failure Reason": self._rich_text_payload(reason)
+            }
+        )
+        if success:
+            logger.info(f"Updated failure reason: {reason[0:100]}...")
+        return success

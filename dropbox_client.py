@@ -25,7 +25,7 @@ class DropboxClient:
         self._connect()
     
     def _connect(self):
-        """Connect to Dropbox using OAuth with team folder namespace access"""
+        """Connect to Dropbox using OAuth with automatic token refresh"""
         # Try to load existing token
         access_token = self._load_token()
         
@@ -40,50 +40,24 @@ class DropboxClient:
                 # Get refresh token for auto-renewal
                 refresh_token = self._load_refresh_token()
                 
-                # Create team client with OAuth2FlowResult for auto-refresh
+                # Create Dropbox client with OAuth2 for auto-refresh
                 if refresh_token:
-                    self.dbx_team = DropboxTeam(
+                    self.dbx = dropbox.Dropbox(
                         oauth2_access_token=access_token,
                         oauth2_refresh_token=refresh_token,
                         app_key=self.app_key,
                         app_secret=self.app_secret
                     )
-                    logger.info("Connected with refresh token - will auto-renew")
+                    logger.info("Connected to Dropbox with refresh token - will auto-renew")
                 else:
-                    self.dbx_team = DropboxTeam(access_token)
+                    self.dbx = dropbox.Dropbox(access_token)
                     logger.warning("No refresh token - token will expire!")
                 
-                # Access team folder namespace using a team member
-                if self.member_id:
-                    # Get team folder namespace ID for 'Insanity'
-                    team_folders = self.dbx_team.team_team_folder_list()
-                    insanity_namespace_id = None
-                    for folder in team_folders.team_folders:
-                        if folder.name == 'Insanity':
-                            # Get the namespace ID from the team folder
-                            insanity_namespace_id = folder.team_folder_id
-                            logger.info(f"Found Insanity folder with namespace ID: {insanity_namespace_id}")
-                            break
-                    
-                    # Create client with team member access
-                    self.dbx = self.dbx_team.as_user(self.member_id)
-                    
-                    # CRITICAL: Set path root to the team folder namespace
-                    # This makes all paths relative to the Insanity team folder
-                    if insanity_namespace_id:
-                        self.dbx = self.dbx.with_path_root(PathRoot.namespace_id(insanity_namespace_id))
-                        logger.info(f"Connected to Dropbox Team with namespace access (member: {self.member_id}, namespace: {insanity_namespace_id})")
-                    else:
-                        logger.warning("Could not find Insanity team folder namespace ID")
-                        logger.info(f"Connected to Dropbox Team (member: {self.member_id})")
-                else:
-                    # Fallback to regular client
-                    self.dbx = dropbox.Dropbox(access_token)
-                    logger.info("Connected to Dropbox")
+                logger.info("Connected to Dropbox (personal account)")
                 
             except Exception as e:
                 logger.error(f"Error connecting to Dropbox: {e}")
-    
+
     def _load_token(self) -> Optional[str]:
         """Load access token from file"""
         if os.path.exists(self.token_file):
